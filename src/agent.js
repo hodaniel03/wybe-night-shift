@@ -672,9 +672,10 @@
     }
 
     async dropExtras(keep) {
-      // Free hands from things no open request needs (keycard etc.).
+      // Free hands from things no open request needs. Never the keycard: there is only one,
+      // and seed 2 lost two room checks after it was left at the charging dock.
       for (const h of [...this.hands]) {
-        if (keep.includes(h)) continue;
+        if (keep.includes(h) || h === 'keycard') continue;
         const r = await this.call('drop', { item: h });
         if (r.ok) this.hands.splice(this.hands.indexOf(h), 1);
       }
@@ -746,9 +747,9 @@
         3: ['corridor-3a', 'corridor-3b', 'corridor-3c', 'corridor-3d'],
       };
       let places = t.places.length ? t.places.slice() : (FLOOR_PLACES[t.floor] || [].concat(FLOOR_PLACES[1], FLOOR_PLACES[2], FLOOR_PLACES[3]));
-      if (!this.carrying('wet-floor-sign')) {
-        if (!(await this.getCart())) return this.finish(req, 'failed', 'Could not get the cart.');
-        if (!(await this.collect(['wet-floor-sign']))) return this.finish(req, 'failed', 'No wet floor sign left in storage.');
+      if (!this.carrying('wet-floor-sign') && !(await this.collect(['wet-floor-sign']))) {
+        // Try with the cart in case the sign does not fit in the hands.
+        if (!(await this.getCart()) || !(await this.collect(['wet-floor-sign']))) return this.finish(req, 'failed', 'No wet floor sign left in storage.');
       }
       const found = [];
       const todo = places.slice();
@@ -910,6 +911,7 @@
       // Make room in the hands.
       const keep = items.slice();
       if (this.cart === null && this.hands.length + missing.length > 2) await this.dropExtras(keep);
+      if (this.cart === null && this.hands.length + missing.length > 2) await this.getCart();
       // Visit sources nearest-first.
       for (let round = 0; round < 3; round++) {
         const still = [];

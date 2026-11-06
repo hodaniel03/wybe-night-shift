@@ -70,3 +70,5 @@ Se `NOTES.md` for alt vi har funnet ut om spillet (tider, poeng, feller).
 | Dato | Seed | Poeng | Kommentar |
 |---|---|---|---|
 | 6. nov | 1 | 1569 | Første skift: manuell utforsking først, agenten tok over fra 23:27 |
+| 6. nov | 2 | 680 | Avslørte at kart/rom/lager varierer. Tralla ble fanget i en stengt korridor, −60 for briller til feil gjest. Siste del ugyldig (to agentløkker samtidig) |
+| 6. nov | 2 | **1403** | Ren kjøring med commit 2-koden, helt uten hjelp: 41 utført, 5 avslått, 9 feilet, 0 sklitak. 140 s sanntid. Mistet nøkkelkortet kl. 04:17 (fikset etterpå) |
