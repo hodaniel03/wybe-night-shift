@@ -147,12 +147,15 @@
     return out;
   }
 
+  // Room numbering differs between nights (seed 1: 311-324 on floor 3, seed 2: 321-334),
+  // so accept any plausible number and find the room on its floor later.
   function findRoom(text, graph) {
-    const re = /\b(?:room[- ]?)?([1-3][0-2]\d)\b/gi;
+    const re = /\b(?:room[- ]?)?([1-3][0-4]\d)\b/gi;
     let m;
     while ((m = re.exec(text))) {
-      const id = 'room-' + m[1];
-      if (graph[id]) return id;
+      const n = Number(m[1]);
+      if (n % 100 === 0) continue;
+      return 'room-' + m[1];
     }
     return null;
   }
@@ -291,6 +294,12 @@
       this.wetSince = {};
       this.slips = 0;
       this.pendingPerson = null;
+      this.supplyLooked = {};
+      this.blocked = {}; // place -> sim second until which we avoid it
+      this.blockTtl = opts.blockTtl || 600;
+      this.verified = {}; // corridors whose doors we have seen tonight
+      this.foundFor = {}; // lost item name -> request id it was found for
+      this.parkCart = opts.parkCart === undefined ? true : opts.parkCart;
 
       this.g = buildGraph(EDGES);
       this.sources = Object.assign({}, DEFAULT_SOURCES);
@@ -345,6 +354,12 @@
         if (e.type === 'slip') { this.slips++; if (cmd === 'move' && args && args.to) this.markWet(args.to); }
         if (e.type === 'person') this.pendingPerson = e.text;
       }
+      // "Closed off: a cleaning crew has blocked that corridor." -> route around it for a while.
+      if (cmd === 'move' && !j.ok && args && args.to && /closed off|blocked|cleaning crew|cordoned/i.test(String(j.result))) {
+        this.blocked[args.to] = clockToSeconds(this.clock) + this.blockTtl;
+        this.log(`BLOCKED ${args.to}: ${j.result}`);
+      }
+      if (cmd === 'move' && j.ok && args && args.to) delete this.blocked[args.to];
       const res = j.result && typeof j.result === 'object' ? (j.result.outcome || j.result) : null;
       if (res && res.notice && /wet/i.test(res.notice) && args && args.to) this.markWet(args.to);
       if (j.note) this.log(`NOTE ${j.note}`);
@@ -381,6 +396,8 @@
 
     // ---- navigation -------------------------------------------------------
     plan(from, to, withCart) {
+      const now = clockToSeconds(this.clock);
+      const isBlocked = (v) => this.blocked && this.blocked[v] !== undefined && this.blocked[v] > now;
       const dist = { [from]: 0 }, prev = {}, done = new Set();
       const pq = [[0, from]];
       while (pq.length) {
@@ -392,6 +409,7 @@
         const nbrs = [];
         for (const [v, m] of Object.entries(this.g[u] || {})) {
           if (isRoom(v)) continue;
+          if (isBlocked(v)) continue;
           const stairs = STAIRS.has(u) && STAIRS.has(v);
           if (stairs && withCart) continue;
           let c = m * (stairs ? SECONDS.stairs : SECONDS.flat);
@@ -424,8 +442,28 @@
     }
 
     corridorOf(room) {
-      const n = Object.keys(this.g[room] || {});
-      return n.find((x) => !isRoom(x)) || null;
+      const n = Object.keys(this.g[room] || {}).filter((x) => !isRoom(x));
+      return n.find((x) => this.verified && this.verified[x]) || n[0] || null;
+    }
+
+    // Which corridor is this room off? Trust only corridors we have looked at tonight;
+    // otherwise walk that floor's corridors (nearest first) and look until we see the door.
+    async locateRoom(room) {
+      const known = this.corridorOf(room);
+      if (known && this.verified[known]) return known;
+      const floor = room.slice(5, 6);
+      const corridors = Object.keys(this.g).filter((n) => new RegExp(`^corridor-${floor}[a-z]$`).test(n));
+      if (known) { corridors.splice(corridors.indexOf(known), 1); corridors.unshift(known); }
+      const todo = corridors.filter((c) => !this.verified[c]);
+      while (todo.length) {
+        if (todo[0] !== known) todo.sort((a, b) => this.cost(this.loc, a) - this.cost(this.loc, b));
+        const c = todo.shift();
+        if (!(await this.goTo(c))) continue;
+        if (!this.verified[c] || this.loc === c) await this.lookAround();
+        const found = this.corridorOf(room);
+        if (found && this.verified[found]) return found;
+      }
+      return this.corridorOf(room);
     }
 
     // Wet floors: walking onto an unseen wet patch = slip (lost minute, and it looks like -15 points).
@@ -438,15 +476,48 @@
       if (/wet patch|wet floor/i.test(res.description || '')) this.markWet(res.location);
       for (const e of res.exits || []) {
         if (e.warning && /wet/i.test(e.warning)) this.markWet(e.to);
+        // Distances and room numbers differ from night to night: learn the real ones.
+        if (typeof e.metres === 'number') {
+          (this.g[res.location] = this.g[res.location] || {})[e.to] = e.metres;
+          (this.g[e.to] = this.g[e.to] || {})[res.location] = e.metres;
+        }
+      }
+      if (Array.isArray(res.exits) && !isRoom(res.location)) {
+        const here = new Set(res.exits.map((e) => e.to));
+        for (const v of Object.keys(this.g[res.location] || {})) {
+          if (isRoom(v) && !here.has(v)) { delete this.g[res.location][v]; if (this.g[v]) delete this.g[v][res.location]; }
+        }
+        this.verified[res.location] = true;
       }
       this.learnObjects(res);
       return res;
     }
 
-    async goTo(target) {
+    async dropCart() {
+      const r = await this.call('drop', { item: 'cart' });
+      if (r.ok) { this.cartAt = this.loc; this.cart = null; this.log(`left the cart at ${this.loc}`); return true; }
+      return false;
+    }
+
+    async goTo(target, depth = 0) {
       if (this.loc === target) return true;
-      const p = this.plan(this.loc, target, this.cart !== null);
-      if (!p) { this.log(`no path ${this.loc} -> ${target}`); return false; }
+      let p = this.plan(this.loc, target, this.cart !== null);
+      if (!p && this.cart !== null && !this.cart.length && depth >= 2) {
+        // Still no way with the cart after waiting: leave the (empty) cart and take the stairs.
+        // (Seed 2: a cart left in a corridor got stranded when a cleaning crew closed it for 45+ min.)
+        const walk = this.plan(this.loc, target, false);
+        if (walk && (await this.dropCart())) p = walk;
+      }
+      if (!p) {
+        // Blocked in. Wait a little (scan = 60 s) and try again, a few times.
+        if (depth < 4 && Object.keys(this.blocked).length) {
+          await this.call('scan');
+          for (const k of Object.keys(this.blocked)) delete this.blocked[k]; // the next move will tell us if it is still closed
+          return this.goTo(target, depth + 1);
+        }
+        this.log(`no path ${this.loc} -> ${target}`);
+        return false;
+      }
       for (const s of p.steps) {
         if (s.type === 'move' && this.watchFloors) {
           const seen = this.lookedAt[this.loc];
@@ -467,6 +538,7 @@
           if (!r.ok) {
             this.log(`move to ${s.to} failed: ${JSON.stringify(r.result)}`);
             await this.syncStatus();
+            if (this.blocked[s.to] !== undefined && depth < 4) return this.goTo(target, depth + 1);
             return false;
           }
           this.loc = s.to;
@@ -499,7 +571,8 @@
         const req = this.requests.get(id);
         if (!req) continue;
         req.updates.push(m.text);
-        if (/cancel|never ?mind|no longer|not needed|forget (it|about)/i.test(m.text)) req.cancelRequested = true;
+        // "Skip R-015, 327 checked out. Don't bother with it."
+        if (/cancel|never ?mind|no longer|not needed|no need|forget (it|about)|\bskip\b|don'?t bother|checked out|disregard|ignore (it|that)/i.test(m.text)) req.cancelRequested = true;
       }
     }
 
@@ -537,8 +610,8 @@
     }
 
     async knock(room) {
-      const corridor = this.corridorOf(room);
-      if (!(await this.goTo(corridor))) return { state: 'unreachable' };
+      const corridor = await this.locateRoom(room);
+      if (!corridor || !(await this.goTo(corridor))) return { state: 'unreachable' };
       const r = await this.call('knock', { door: room });
       const text = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
       this.noteGuest(text);
@@ -549,12 +622,34 @@
       return { state: r.ok ? 'other' : 'error', text };
     }
 
+    // Supplies move between storage and laundry from night to night: trust what we see.
     learnObjects(lookResult) {
       if (!lookResult || !lookResult.location || !Array.isArray(lookResult.objects)) return;
+      const here = lookResult.location;
+      const seen = new Set();
+      const supplyRoom = here === 'storage' || here === 'laundry';
       for (const o of lookResult.objects) {
         const name = String(o).replace(/\s+x\d+$/, '');
-        if (/ x\d+$/.test(String(o)) && !this.sources[name]) this.sources[name] = lookResult.location;
+        seen.add(name);
+        if (name === 'cart') { this.cartAt = here; continue; }
+        if (supplyRoom || / x\d+$/.test(String(o))) this.sources[name] = here;
       }
+      if (here === 'storage' || here === 'laundry') {
+        for (const [item, src] of Object.entries(this.sources)) if (src === here && !seen.has(item)) delete this.sources[item];
+        this.supplyLooked[here] = true;
+      }
+    }
+
+    // Find where an item is kept: known source, else look in the supply rooms we have not seen.
+    async findSource(item) {
+      if (this.sources[item]) return this.sources[item];
+      for (const room of ['storage', 'laundry']) {
+        if (this.supplyLooked[room]) continue;
+        if (!(await this.goTo(room))) continue;
+        await this.lookAround();
+        if (this.sources[item]) return this.sources[item];
+      }
+      return this.sources[item] || null;
     }
 
     async pickItem(item) {
@@ -606,11 +701,13 @@
     // Housekeeping cart: carries anything (heavy trays too) but cannot take the stairs.
     async getCart() {
       if (this.cart !== null) return true;
-      const where = this.cartAt || 'laundry';
-      if (!(await this.goTo(where))) return false;
-      const r = await this.call('use', { item: 'cart' });
-      if (r.ok) { this.cart = []; this.cartAt = null; return true; }
-      this.log(`use cart failed: ${JSON.stringify(r.result)}`);
+      const places = [this.cartAt, 'laundry', 'storage'].filter((p, i, a) => p && a.indexOf(p) === i);
+      for (const where of places) {
+        if (!(await this.goTo(where))) continue;
+        const r = await this.call('use', { item: 'cart' });
+        if (r.ok) { this.cart = []; this.cartAt = null; return true; }
+        this.log(`use cart at ${where} failed: ${JSON.stringify(r.result)}`);
+      }
       return false;
     }
 
@@ -698,7 +795,8 @@
     // Noise complaint "near 201": find where the noise really comes from, knock, ask politely.
     async handle_noise(req) {
       const t = req.task;
-      const corridor = this.corridorOf(t.room);
+      const corridor = await this.locateRoom(t.room);
+      if (!corridor) return this.finish(req, 'failed', `Could not find ${t.room}.`);
       const tried = [];
       const candidates = [corridor, ...Object.keys(this.g[corridor] || {}).filter((n) => /^corridor/.test(n))];
       for (const c of candidates) {
@@ -760,7 +858,7 @@
       if (!name) return this.finish(req, 'failed', `Nothing matching "${t.what}" at ${t.from} (saw: ${objs.join(', ')}).`);
       if (!(await this.pickItem(name))) return this.finish(req, 'failed', `Could not pick up ${name}.`);
       if (t.empty) {
-        if (!(await this.goTo(this.corridorOf(t.room)))) return this.finish(req, 'failed', `Could not reach ${t.room}.`);
+        if (!(await this.goTo(await this.locateRoom(t.room)))) return this.finish(req, 'failed', `Could not reach ${t.room}.`);
         const u = await this.call('use', { item: 'keycard', on: t.room });
         if (!u.ok) return this.finish(req, 'failed', `Keycard did not open ${t.room}.`);
         if (!(await this.placeInRoom(t.room, name))) return this.finish(req, 'failed', `Could not leave ${name} in ${t.room}.`);
@@ -772,8 +870,9 @@
     async handle_inspect(req) {
       const t = req.task;
       const room = t.room;
-      const corridor = this.corridorOf(room);
       const k = await this.knock(room);
+      const corridor = await this.locateRoom(room);
+      if (k.state === 'unreachable' || !corridor) return this.finish(req, 'failed', `Could not reach ${room}.`);
       if (k.state === 'open') return this.finish(req, 'done', `${room} is not empty: ${k.text}`);
       if (k.state === 'dnd') return this.finish(req, 'declined', `${room} has a Do Not Disturb sign, so I did not go in.`);
       if (!(await this.getKeycard())) return this.finish(req, 'failed', 'Could not get a keycard.');
@@ -812,23 +911,34 @@
       const keep = items.slice();
       if (this.cart === null && this.hands.length + missing.length > 2) await this.dropExtras(keep);
       // Visit sources nearest-first.
-      const bySource = {};
-      for (const it of missing) {
-        const src = this.sources[it];
-        if (!src) { this.log(`no known source for ${it}`); return false; }
-        (bySource[src] = bySource[src] || []).push(it);
-      }
-      let srcs = Object.keys(bySource);
-      while (srcs.length) {
+      for (let round = 0; round < 3; round++) {
+        const still = [];
+        const have2 = {};
+        for (const it of items) { have2[it] = (have2[it] || 0) + 1; if (this.carrying(it) < have2[it]) still.push(it); }
+        if (!still.length) return true;
+        const bySource = {};
+        for (const it of still) {
+          const src = await this.findSource(it);
+          if (!src) { this.log(`no known source for ${it}`); return false; }
+          (bySource[src] = bySource[src] || []).push(it);
+        }
+        const srcs = Object.keys(bySource);
         srcs.sort((a, b) => this.cost(this.loc, a) - this.cost(this.loc, b));
-        const src = srcs.shift();
-        if (!(await this.goTo(src))) return false;
-        for (const it of bySource[src]) {
-          if (this.freeHands() <= 0) return false;
-          if (!(await this.pickItem(it))) return false;
+        for (const src of srcs) {
+          if (!(await this.goTo(src))) return false;
+          for (const it of bySource[src]) {
+            if (this.freeHands() <= 0) return false;
+            if (!(await this.pickItem(it))) {
+              // "No pillow here." -> forget this source, look in the other supply room next round.
+              if (this.sources[it] === src) delete this.sources[it];
+              this.supplyLooked[src] = false;
+              await this.lookAround();
+              break;
+            }
+          }
         }
       }
-      return true;
+      return items.every((it, i) => this.carrying(it) >= items.slice(0, i + 1).filter((x) => x === it).length);
     }
 
     async placeInRoom(room, item) {
@@ -850,14 +960,16 @@
       if (this.dnd.has(room)) return this.finish(req, 'declined', `Do Not Disturb sign on ${room}; did not disturb the guest.`);
       const items = [];
       for (const { item, qty } of t.items) for (let i = 0; i < qty; i++) items.push(item);
-      for (const it of items) if (!this.sources[it] && !this.carrying(it)) {
+      for (const it of items) if (!this.carrying(it) && !(await this.findSource(it))) {
         return this.finish(req, 'failed', `We have no ${it} in storage or laundry.`);
       }
       // Deliver in chunks of what fits in the hands.
       let delivered = 0;
       const total = items.length;
+      const missing = items.filter((it, i) => this.carrying(it) < items.slice(0, i + 1).filter((x) => x === it).length).length;
+      if (this.cart === null && missing > 2 - this.hands.length) await this.getCart();
       while (delivered < total) {
-        const chunk = items.slice(delivered, delivered + Math.max(1, this.cart !== null ? total : 2));
+        const chunk = items.slice(delivered, delivered + (this.cart !== null ? total : Math.max(1, 2 - this.hands.length)));
         if (!(await this.collect(chunk))) return this.finish(req, 'failed', `Could not get ${chunk.join(', ')}.`);
         const k = await this.knock(room);
         if (k.state === 'dnd') return this.finish(req, 'declined', `Do Not Disturb sign on ${room}; did not disturb the guest.`);
@@ -906,8 +1018,9 @@
       }
       const scanned = [];
       let foundName = null;
-      const carried = [...this.hands, ...(this.cart || [])].find(matches);
-      if (carried) foundName = carried;
+      // Only reuse an item we already carry if it was found for THIS request.
+      // Seed 2: handing glasses found for 327 to the guest in 207 cost -60.
+      if (req.found && [...this.hands, ...(this.cart || [])].includes(req.found)) foundName = req.found;
       for (const ring of [places, extra.slice(0, 3)]) {
         const todo = ring.filter((p) => !scanned.includes(p));
         while (!foundName && todo.length) {
@@ -919,15 +1032,25 @@
           const found = (r.result && r.result.found) || [];
           const hit = found.find(matches);
           if (hit) {
+            // Look while it is still in sight: the description may say whose it is.
+            const seen = await this.call('look', { at: hit });
+            this.log(`found ${hit} at ${p}: ${JSON.stringify(seen.result)}`);
             if (this.freeHands() <= 0) await this.dropExtras([]);
-            if (await this.pickItem(hit)) foundName = hit;
+            if (await this.pickItem(hit)) { foundName = hit; req.found = hit; this.foundFor[hit] = req.id; }
           }
         }
         if (foundName) break;
       }
-      if (!foundName) return this.finish(req, 'failed', `Scanned ${scanned.join(', ') || 'nothing'}; no ${t.item} found.`);
-      const look = await this.call('look', { at: foundName });
-      this.log(`found ${foundName}: ${JSON.stringify(look.result)}`);
+      if (!foundName) {
+        // Lost things sometimes turn up later in the night. Try once more in ~40 minutes.
+        if (!req.retried && clockToSeconds(this.clock) < 7 * 3600) {
+          req.retried = true;
+          req.notBefore = clockToSeconds(this.clock) + 40 * 60;
+          this.log(`RETRY LATER ${req.id}: no ${t.item} in ${scanned.join(', ')}`);
+          return;
+        }
+        return this.finish(req, 'failed', `Scanned ${scanned.join(', ') || 'nothing'}; no ${t.item} found.`);
+      }
       const room = await this.resolveRoom(req);
       if (!room) return this.finish(req, 'failed', `Found the ${foundName} but could not find the owner's room.`);
       const k = await this.knock(room);
@@ -942,7 +1065,12 @@
 
     // ---- idle / battery ---------------------------------------------------
     async idle() {
-      if (this.loc !== 'charging-dock') await this.goTo('charging-dock');
+      // Park the cart in the lobby (never blocked) so it cannot get stranded upstairs.
+      if (this.cart !== null && this.parkCart && (await this.goTo('lobby'))) await this.dropCart();
+      if (this.loc !== 'charging-dock' && !(await this.goTo('charging-dock'))) {
+        await this.call('scan'); // cannot reach the dock right now: let a minute pass
+        return;
+      }
       // A message may have arrived on the way. Docking now would sleep until the NEXT one.
       if (this.unread) return;
       await this.syncStatus();
@@ -950,6 +1078,11 @@
       const before = this.clock;
       const r = await this.call('dock');
       this.log(`DOCK ${JSON.stringify(r.result)}`);
+      if (!r.ok && /already full/i.test(String(r.result))) {
+        // A full battery cannot dock. `scan` is the cheapest way to let a minute pass (60 s per call).
+        await this.call('scan');
+        return;
+      }
       if (!this.unread && this.clock === before) this.idleStreak++;
       else this.idleStreak = 0;
       if (this.idleStreak >= 3) { this.log('dock does not advance time; stopping'); this.over = true; }
@@ -976,7 +1109,8 @@
     }
 
     nextRequest() {
-      const open = this.openRequests().filter((r) => !r.cancelRequested);
+      const now = clockToSeconds(this.clock);
+      const open = this.openRequests().filter((r) => !r.cancelRequested && !(r.notBefore > now));
       if (!open.length) return null;
       open.sort((a, b) => (this.urgency(b) - this.urgency(a)) || (a.atS - b.atS)
         || (this.cost(this.loc, this.target(a)) - this.cost(this.loc, this.target(b))));
@@ -995,16 +1129,28 @@
         if (!this.paused) {
           await this.syncStatus();
           if (this.prepare) {
-            // Keycard (room checks) + cart (heavy trays, carries everything) before the first request.
+            // Keycard (room checks) + cart (heavy trays, carries everything) before the first request,
+            // and a look into both supply rooms, since their contents change from night to night.
             await this.getKeycard();
             await this.getCart();
+            for (const room of ['laundry', 'storage']) {
+              if (this.supplyLooked[room] || this.unread) continue;
+              if (await this.goTo(room)) await this.lookAround();
+            }
           }
         }
         this.paused = null;
         while (!this.over) {
+          if (this.hold) throw new Paused('hold'); // set agent.hold = true to pause between tasks
           if (this.unread) await this.readInbox();
           for (const req of this.openRequests()) {
             if (req.cancelRequested) await this.finish(req, 'cancelled', 'Cancelled by the night manager.');
+          }
+          // Shortly before 06:00, close anything still waiting for a retry (open requests cost points at the end).
+          if (clockToSeconds(this.clock) > 7 * 3600 + 50 * 60) {
+            for (const req of this.openRequests()) {
+              if (req.notBefore) await this.finish(req, 'failed', 'Searched twice tonight; it did not turn up.');
+            }
           }
           if (this.battery < this.lowBattery) { await this.charge(); continue; }
           const req = this.nextRequest();
@@ -1025,7 +1171,7 @@
     }
   }
 
-  const api = { Agent, startShift, apiCall, parseRequest, buildGraph, EDGES, clockToSeconds };
+  const api = { Agent, startShift, apiCall, parseRequest, buildGraph, EDGES, clockToSeconds, Paused, ShiftOver };
   root.NightShift = api;
   if (typeof module === 'object' && module.exports) module.exports = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
