@@ -1,0 +1,1031 @@
+/*
+ * Wybe Night Shift agent ("Ghosts").
+ *
+ * Runs in Node 18+ (uses global fetch) and can also be pasted into a browser
+ * page on https://nightshift.wybe.me/ (defines window.NightShift).
+ *
+ * Protocol: POST / with JSON {cmd, args}. Header Authorization: Bearer <key>.
+ * During a shift every call also carries X-Shift: <shift id>.
+ */
+(function (root) {
+  'use strict';
+
+  const DEFAULT_BASE = 'https://nightshift.wybe.me/';
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // ---------------------------------------------------------------------------
+  // Hotel map (explored on practice seed 1). Distances in metres.
+  // ---------------------------------------------------------------------------
+  const EDGES = [
+    ['charging-dock', 'lobby', 8],
+    ['lobby', 'front-desk', 7], ['lobby', 'lobby-bar', 10], ['lobby', 'elevator-1', 6], ['lobby', 'corridor-1a', 9],
+    ['corridor-1a', 'corridor-1b', 13], ['corridor-1a', 'staff-room', 3],
+    ['corridor-1a', 'room-101', 4], ['corridor-1a', 'room-102', 5], ['corridor-1a', 'room-103', 3],
+    ['corridor-1b', 'corridor-1c', 13], ['corridor-1b', 'storage', 5], ['corridor-1b', 'laundry', 5],
+    ['corridor-1b', 'room-104', 4], ['corridor-1b', 'room-105', 5], ['corridor-1b', 'room-106', 4],
+    ['corridor-1c', 'kitchen-pass', 5], ['corridor-1c', 'stairwell-1', 7],
+    ['corridor-1c', 'room-107', 3], ['corridor-1c', 'room-108', 5],
+    ['stairwell-1', 'stairwell-2', 19], ['stairwell-2', 'stairwell-3', 19],
+    ['stairwell-2', 'corridor-2d', 6],
+    ['corridor-2d', 'corridor-2c', 12], ['corridor-2d', 'corridor-2a', 16],
+    ['corridor-2d', 'room-211', 3], ['corridor-2d', 'room-212', 4], ['corridor-2d', 'room-213', 4], ['corridor-2d', 'room-214', 4],
+    ['corridor-2c', 'corridor-2b', 18],
+    ['corridor-2c', 'room-208', 4], ['corridor-2c', 'room-209', 4], ['corridor-2c', 'room-210', 4],
+    ['corridor-2b', 'corridor-2a', 13],
+    ['corridor-2b', 'room-204', 3], ['corridor-2b', 'room-205', 5], ['corridor-2b', 'room-206', 4], ['corridor-2b', 'room-207', 4],
+    ['corridor-2a', 'elevator-2', 4],
+    ['corridor-2a', 'room-201', 4], ['corridor-2a', 'room-202', 4], ['corridor-2a', 'room-203', 5],
+    ['stairwell-3', 'corridor-3d', 6],
+    ['corridor-3d', 'corridor-3c', 16], ['corridor-3d', 'corridor-3a', 18],
+    ['corridor-3d', 'room-321', 3], ['corridor-3d', 'room-322', 3], ['corridor-3d', 'room-323', 4], ['corridor-3d', 'room-324', 3],
+    ['corridor-3c', 'corridor-3b', 16],
+    ['corridor-3c', 'room-318', 4], ['corridor-3c', 'room-319', 3], ['corridor-3c', 'room-320', 5],
+    ['corridor-3b', 'corridor-3a', 16],
+    ['corridor-3b', 'room-314', 4], ['corridor-3b', 'room-315', 5], ['corridor-3b', 'room-316', 3], ['corridor-3b', 'room-317', 4],
+    ['corridor-3a', 'elevator-3', 6],
+    ['corridor-3a', 'room-311', 4], ['corridor-3a', 'room-312', 4], ['corridor-3a', 'room-313', 4],
+  ];
+  const DOORS = new Set(['storage', 'laundry']); // entering costs ~3 s extra
+  const STAIRS = new Set(['stairwell-1', 'stairwell-2', 'stairwell-3']);
+  const ELEVATOR_OF_FLOOR = { 1: 'elevator-1', 2: 'elevator-2', 3: 'elevator-3' };
+  const SECONDS = { flat: 1, stairs: 3, elevator: 60, door: 3 };
+
+  // Where supplies live (updated at runtime from `look`).
+  const DEFAULT_SOURCES = {
+    towel: 'storage', 'toiletry-kit': 'storage', 'water-bottle': 'storage',
+    'phone-charger': 'storage', 'wet-floor-sign': 'storage', pillow: 'laundry',
+  };
+
+  const ITEM_ALIASES = [
+    [/phone[- ]?chargers?|chargers?/, 'phone-charger'],
+    [/water[- ]?bottles?|bottles? of water|water/, 'water-bottle'],
+    [/toiletry[- ]?kits?|toiletries/, 'toiletry-kit'],
+    [/bath ?towels?|towels?/, 'towel'],
+    [/pillows?/, 'pillow'],
+    [/wet[- ]?floor[- ]?signs?/, 'wet-floor-sign'],
+    [/glasses|spectacles/, 'glasses'],
+  ];
+  const NUMBERS = { a: 1, an: 1, one: 1, another: 1, extra: 1, two: 2, three: 3, four: 4, five: 5, couple: 2, pair: 1 };
+
+  const PLACE_HINTS = [
+    [/ground[- ]floor corridor|corridor on the ground floor|first[- ]floor corridor|floor 1 corridor|downstairs corridor/, ['corridor-1a', 'corridor-1b', 'corridor-1c']],
+    [/(second|2nd)[- ]floor corridor|floor 2 corridor/, ['corridor-2a', 'corridor-2b', 'corridor-2c', 'corridor-2d']],
+    [/(third|3rd)[- ]floor corridor|floor 3 corridor/, ['corridor-3a', 'corridor-3b', 'corridor-3c', 'corridor-3d']],
+    [/lobby[- ]bar|\bbar\b/, ['lobby-bar']],
+    [/lobby/, ['lobby']],
+    [/front[- ]desk|reception/, ['front-desk']],
+    [/staff[- ]room/, ['staff-room']],
+    [/kitchen/, ['kitchen-pass']],
+    [/laundry/, ['laundry']],
+    [/storage/, ['storage']],
+    [/stair/, ['stairwell-1', 'stairwell-2', 'stairwell-3']],
+    [/elevator|\blift\b/, ['elevator-1', 'elevator-2', 'elevator-3']],
+    [/charging|dock/, ['charging-dock']],
+  ];
+
+  const PLACE_WORDS = [
+    [/front[- ]desk|\bdesk\b|reception/, 'front-desk'],
+    [/kitchen/, 'kitchen-pass'],
+    [/lobby[- ]bar|\bbar\b/, 'lobby-bar'],
+    [/lobby/, 'lobby'],
+    [/laundry/, 'laundry'],
+    [/storage/, 'storage'],
+    [/staff[- ]room/, 'staff-room'],
+    [/charging|dock/, 'charging-dock'],
+  ];
+  function placeOf(phrase) {
+    const p = phrase.toLowerCase();
+    for (const [re, place] of PLACE_WORDS) if (re.test(p)) return place;
+    return null;
+  }
+  // Words in requests -> object name prefix in the world.
+  const OBJECT_WORDS = [
+    [/bags?|suitcases?|luggage/, 'luggage'],
+    [/trays?|room[- ]service|food|dinner|breakfast/, 'tray'],
+  ];
+
+  function buildGraph(edges) {
+    const g = {};
+    for (const [a, b, m] of edges) {
+      (g[a] = g[a] || {})[b] = m;
+      (g[b] = g[b] || {})[a] = m;
+    }
+    return g;
+  }
+
+  const isRoom = (n) => /^room-\d{3}$/.test(n);
+
+  function clockToSeconds(clock) {
+    if (!clock) return null;
+    const [h, m, s] = clock.split(':').map(Number);
+    const hh = h < 12 ? h + 24 : h;
+    return (hh - 22) * 3600 + m * 60 + (s || 0);
+  }
+
+  function normalizeItem(phrase) {
+    const p = phrase.toLowerCase().trim();
+    for (const [re, id] of ITEM_ALIASES) if (re.test(p)) return id;
+    return p.replace(/^(a|an|the|some|extra|another)\s+/, '').replace(/\s+/g, '-').replace(/s$/, '');
+  }
+
+  function parseItems(phrase) {
+    // "a towel and two pillows", "an extra pillow"
+    const out = [];
+    const parts = phrase.toLowerCase().replace(/[.!?]+$/, '').split(/,|\band\b|\bplus\b/);
+    for (let part of parts) {
+      part = part.trim();
+      if (!part) continue;
+      let qty = 1;
+      const m = part.match(/^(\d+|a couple of|a pair of|a|an|one|two|three|four|five|another|extra|some)\s+(.*)$/);
+      if (m) {
+        const w = m[1].replace(/^a (couple|pair) of$/, '$1');
+        qty = /^\d+$/.test(w) ? Number(w) : (NUMBERS[w] || 1);
+        part = m[2].replace(/^(extra|more|fresh|clean|new)\s+/, '');
+      }
+      out.push({ item: normalizeItem(part), qty });
+    }
+    return out;
+  }
+
+  function findRoom(text, graph) {
+    const re = /\b(?:room[- ]?)?([1-3][0-2]\d)\b/gi;
+    let m;
+    while ((m = re.exec(text))) {
+      const id = 'room-' + m[1];
+      if (graph[id]) return id;
+    }
+    return null;
+  }
+
+  function findName(text) {
+    const m = text.match(/\b(Mr|Mrs|Ms|Mx|Miss|Dr)\.?\s+([A-ZÆØÅ][A-Za-zÆØÅæøå'-]+)/);
+    return m ? `${m[1]} ${m[2]}` : null;
+  }
+
+  function placesFromHint(text) {
+    const t = text.toLowerCase();
+    const places = [];
+    const direct = t.match(/corridor-(\d[a-d])/g) || [];
+    for (const d of direct) places.push(d);
+    for (const [re, ps] of PLACE_HINTS) if (re.test(t)) for (const p of ps) if (!places.includes(p)) places.push(p);
+    return places;
+  }
+
+  // Turn a night-manager message into a task.
+  function parseRequest(text, graph) {
+    const body = text.replace(/^R-\d+:\s*/, '').trim();
+    const room = findRoom(body, graph);
+    const name = findName(body);
+    let m;
+
+    // "Bring the tray from the kitchen pass to 104." / "Take the bags at the desk up to 206. The room is empty, ..."
+    if ((m = body.match(/\b(?:bring|take|deliver|carry|run|move)\s+(?:the\s+|a\s+|some\s+)?(.+?)\s+(?:at|from|in|waiting at|on|by)\s+(?:the\s+)?(.+?)\s+(?:up\s+|down\s+|over\s+|back\s+)?to\s+(?:room[- ]?)?(\d{3})/i))) {
+      const from = placeOf(m[2]);
+      if (from) {
+        return {
+          type: 'fetch', room: 'room-' + m[3], name, what: m[1].toLowerCase(), from,
+          empty: /room is empty|checks? in later|not in (the|their) room|nobody is (in|there)|guest is out/i.test(body),
+        };
+      }
+    }
+    // "Room service for Dr Engen is waiting at the kitchen pass."
+    if ((m = body.match(/^(?:the\s+)?(.+?)\s+for\s+(.+?)\s+(?:is|are)\s+(?:waiting|ready)\s+(?:at|in|by)\s+(?:the\s+)?(.+?)[.!]?$/i))) {
+      const from = placeOf(m[3]);
+      if (from) return { type: 'fetch', room, name, what: m[1].toLowerCase(), from, empty: false };
+    }
+    // "Someone mentioned a spill on floor 3."
+    if (/\b(spill|spilled|spilt|puddle|wet floor|wet patch|slippery)\b/i.test(body)) {
+      const fm = body.match(/floor\s*(\d)|(ground|first|second|third)[- ]floor/i);
+      const floor = fm ? (fm[1] ? Number(fm[1]) : { ground: 1, first: 1, second: 2, third: 3 }[fm[2].toLowerCase()]) : null;
+      return { type: 'spill', floor, room, name, places: placesFromHint(body) };
+    }
+    // "Complaint about noise near 201."
+    if (/\b(noise|noisy|loud|music|party|shouting|banging)\b/i.test(body) && room) {
+      return { type: 'noise', room, name };
+    }
+    // "Front desk passed on a call from 319: the guest says the water bottle they ordered an hour ago never came."
+    if ((m = body.match(/\b(?:says|claims|complains)\s+(?:that\s+)?(?:the|their|his|her|a|an)\s+(.+?)\s+(?:they|he|she|the guest)\s+(?:ordered|asked for|requested)/i))) {
+      return { type: 'complaint', room, name, item: normalizeItem(m[1]) };
+    }
+    if ((m = body.match(/\b(?:check|see|inspect|look)\s+(?:if|whether|that|on|in)?\s*(?:room[- ]?)?(\d{3})\s+(?:is\s+)?(.*?)(?:,|\.|$)/i))) {
+      return { type: 'inspect', room: 'room-' + m[1], name, what: m[2] };
+    }
+    if ((m = body.match(/^(?:please\s+)?(?:tell|let|inform|remind)\s+(?:the guest in\s+|guest in\s+|the guests? in\s+)?(?:room[- ]?)?(\d{3})\s+(?:know\s+)?(?:that\s+)?(.+)$/i))) {
+      return { type: 'tell', room: 'room-' + m[1], name, message: m[2].replace(/[.!]+$/, '') };
+    }
+    // "Let Mx Haugen know their wake-up call is set for half past six."
+    if ((m = body.match(/^(?:please\s+)?(?:tell|let|inform|remind)\s+(?:Mr|Mrs|Ms|Mx|Miss|Dr)\.?\s+[A-ZÆØÅ][A-Za-zÆØÅæøå'-]+\s+(?:know\s+)?(?:that\s+)?(.+)$/i)) && name) {
+      return { type: 'tell', room, name, message: m[1].replace(/[.!]+$/, '') };
+    }
+    if ((m = body.match(/\b(?:lost|left|dropped|misplaced|forgot)\s+(?:his|her|their|a|an|the|my|its)?\s*(?:pair of\s+)?([a-z][a-z' -]*?)(?=,|\.|\s+earlier|\s+somewhere|\s+maybe|\s+probably|\s+possibly|\s+near|\s+in the|\s+on the|\s+at the|\s+around|\s+tonight|\s+today|$)/i))) {
+      const phrase = m[1].toLowerCase().trim();
+      const item = normalizeItem(phrase);
+      const words = phrase.replace(/'s\b/g, '').split(/[\s-]+/).filter((w) => w && !/^(a|an|the|his|her|their|my|its|little|small|big|child|kid|baby)$/.test(w));
+      const last = words[words.length - 1] || item;
+      const key = /ss$|glasses$|keys$/.test(last) ? last.replace(/keys$/, 'key') : last.replace(/s$/, '');
+      return { type: 'lost', item, key, room, name, places: placesFromHint(body) };
+    }
+    if ((m = body.match(/\b(?:wants|needs|would like|asks for|is asking for|requests|could use|asked for)\s+(.+?)[.!]?$/i))) {
+      return { type: 'deliver', room, name, items: parseItems(m[1]) };
+    }
+    return { type: 'unknown', room, name };
+  }
+
+  class ShiftOver extends Error {}
+  class Paused extends Error {}
+
+  // ---------------------------------------------------------------------------
+  // Raw API call (no shift header), used for start_shift / shifts / whoami.
+  // ---------------------------------------------------------------------------
+  async function apiCall({ key, base = DEFAULT_BASE, shift = null, cmd, args }) {
+    let wait = 600;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' };
+      if (shift) headers['X-Shift'] = shift;
+      let res, text;
+      try {
+        res = await fetch(base, { method: 'POST', headers, body: JSON.stringify(args === undefined ? { cmd } : { cmd, args }) });
+        text = await res.text();
+      } catch (e) {
+        await sleep(wait); wait = Math.min(wait * 2, 8000); continue;
+      }
+      let j;
+      try { j = JSON.parse(text); } catch (e) { j = { ok: false, result: text }; }
+      const r = typeof j.result === 'string' ? j.result : '';
+      if (res.status === 429 || /too many requests|slow down/i.test(r)) {
+        await sleep(wait); wait = Math.min(wait * 2, 8000); continue;
+      }
+      j._status = res.status;
+      return j;
+    }
+    throw new Error('Rate limited for too long');
+  }
+
+  async function startShift({ key, base = DEFAULT_BASE, mode = 'practice', seed }) {
+    const args = { mode };
+    if (seed !== undefined && seed !== null) args.seed = Number(seed);
+    const j = await apiCall({ key, base, cmd: 'start_shift', args });
+    if (!j.ok || !j.result || !j.result.shift) throw new Error('start_shift failed: ' + JSON.stringify(j));
+    return j.result; // {shift, seed, mode, clock, text}
+  }
+
+  // ---------------------------------------------------------------------------
+  // The agent
+  // ---------------------------------------------------------------------------
+  class Agent {
+    constructor(opts) {
+      this.key = opts.key;
+      this.base = opts.base || DEFAULT_BASE;
+      this.shift = opts.shift;
+      this.onUnknown = opts.onUnknown || 'skip'; // 'pause' | 'skip' | 'decline'
+      this.minGapMs = opts.minGapMs === undefined ? 80 : opts.minGapMs;
+      this.logFn = opts.log || ((s) => console.log(s));
+      this.lowBattery = opts.lowBattery || 18;
+      this.chargeTo = opts.chargeTo || 45;
+      this.prepare = opts.prepare === undefined ? true : opts.prepare;
+      this.cartAt = null;
+      this.watchFloors = opts.watchFloors === undefined ? true : opts.watchFloors;
+      this.lookTtl = opts.lookTtl || 600; // seconds of sim time a `look` stays trusted
+      this.lookedAt = {};
+      this.wet = new Set();
+      this.wetSince = {};
+      this.slips = 0;
+      this.pendingPerson = null;
+
+      this.g = buildGraph(EDGES);
+      this.sources = Object.assign({}, DEFAULT_SOURCES);
+      this.trace = [];
+      this.lines = [];
+      this.requests = new Map();
+      this.roomOf = {}; // "Mr Berg" -> "room-319"
+      this.dnd = new Set();
+      this.loc = 'charging-dock';
+      this.hands = [];
+      this.cart = null;
+      this.battery = 100;
+      this.score = 0;
+      this.clock = '22:00:00';
+      this.unread = true;
+      this.over = false;
+      this.paused = null;
+      this.lastCallAt = 0;
+      this.calls = 0;
+      this.idleStreak = 0;
+    }
+
+    log(s) {
+      const line = `${this.clock} ${s}`;
+      this.lines.push(line);
+      this.logFn(line);
+    }
+
+    // ---- transport --------------------------------------------------------
+    async call(cmd, args) {
+      if (this.over) throw new ShiftOver('shift over');
+      const gap = Date.now() - this.lastCallAt;
+      if (gap < this.minGapMs) await sleep(this.minGapMs - gap);
+      this.lastCallAt = Date.now();
+      const j = await apiCall({ key: this.key, base: this.base, shift: this.shift, cmd, args });
+      this.calls++;
+      this.absorb(cmd, args, j);
+      // Answer people who stop the robot right where it is (before walking on).
+      if (cmd === 'move' && this.pendingPerson && !this._responding && !this.over) {
+        this._responding = true;
+        try { await this.respondPerson(); } finally { this._responding = false; }
+      }
+      return j;
+    }
+
+    absorb(cmd, args, j) {
+      if (j.clock) this.clock = j.clock;
+      this.trace.push({ clock: j.clock, cmd, args, ok: j.ok, result: j.result, events: j.events, note: j.note });
+      for (const e of j.events || []) {
+        if (e.type === 'inbox') this.unread = true;
+        else if (e.type !== 'dock') this.log(`EVENT ${JSON.stringify(e)}`);
+        if (e.type === 'slip') { this.slips++; if (cmd === 'move' && args && args.to) this.markWet(args.to); }
+        if (e.type === 'person') this.pendingPerson = e.text;
+      }
+      const res = j.result && typeof j.result === 'object' ? (j.result.outcome || j.result) : null;
+      if (res && res.notice && /wet/i.test(res.notice) && args && args.to) this.markWet(args.to);
+      if (j.note) this.log(`NOTE ${j.note}`);
+      const text = typeof j.result === 'string' ? j.result : JSON.stringify(j.result || '');
+      // 06:00: {"outcome":..., "shift_over":true, "reason":"time", "score":1569, ...} + event {type:"shift"}
+      if (j.result && j.result.shift_over) {
+        this.over = true;
+        if (typeof j.result.score === 'number') this.score = j.result.score;
+        this.log(`SHIFT OVER (${j.result.reason}): score ${j.result.score}, served ${j.result.requests_served}`);
+      } else if ((j.events || []).some((e) => e.type === 'shift') || /already ended|start a new one|shift (is )?(over|ended|finished|closed)|no (active|live) shift|clocked out/i.test(text)) {
+        this.over = true;
+        this.log(`SHIFT OVER: ${text}`);
+      }
+    }
+
+    markWet(place) {
+      this.wet.add(place);
+      if (this.wetSince[place] === undefined) this.wetSince[place] = clockToSeconds(this.clock);
+    }
+
+    async syncStatus() {
+      const r = await this.call('status');
+      if (r.ok && r.result) {
+        const s = r.result;
+        this.loc = s.location || this.loc;
+        this.hands = s.hands || [];
+        this.cart = s.cart === undefined ? this.cart : s.cart;
+        this.battery = s.battery;
+        this.score = s.score;
+        if (s.unread_messages) this.unread = true;
+      }
+      return r;
+    }
+
+    // ---- navigation -------------------------------------------------------
+    plan(from, to, withCart) {
+      const dist = { [from]: 0 }, prev = {}, done = new Set();
+      const pq = [[0, from]];
+      while (pq.length) {
+        pq.sort((x, y) => x[0] - y[0]);
+        const [d, u] = pq.shift();
+        if (done.has(u)) continue;
+        done.add(u);
+        if (u === to) break;
+        const nbrs = [];
+        for (const [v, m] of Object.entries(this.g[u] || {})) {
+          if (isRoom(v)) continue;
+          const stairs = STAIRS.has(u) && STAIRS.has(v);
+          if (stairs && withCart) continue;
+          let c = m * (stairs ? SECONDS.stairs : SECONDS.flat);
+          if (DOORS.has(v)) c += SECONDS.door;
+          if (this.wet && this.wet.has(v)) c += 10; // creeping over a known wet floor
+          nbrs.push([v, c, { type: 'move', to: v }]);
+        }
+        if (/^elevator-\d$/.test(u)) {
+          for (const f of [1, 2, 3]) {
+            const v = ELEVATOR_OF_FLOOR[f];
+            if (v !== u) nbrs.push([v, SECONDS.elevator, { type: 'elevator', floor: f, to: v }]);
+          }
+        }
+        for (const [v, c, step] of nbrs) {
+          const nd = d + c;
+          if (dist[v] === undefined || nd < dist[v]) { dist[v] = nd; prev[v] = { u, step }; pq.push([nd, v]); }
+        }
+      }
+      if (dist[to] === undefined) return null;
+      const steps = [];
+      let c = to;
+      while (c !== from) { steps.unshift(prev[c].step); c = prev[c].u; }
+      return { steps, cost: dist[to] };
+    }
+
+    cost(from, to) {
+      if (from === to) return 0;
+      const p = this.plan(from, to, this.cart !== null);
+      return p ? p.cost : Infinity;
+    }
+
+    corridorOf(room) {
+      const n = Object.keys(this.g[room] || {});
+      return n.find((x) => !isRoom(x)) || null;
+    }
+
+    // Wet floors: walking onto an unseen wet patch = slip (lost minute, and it looks like -15 points).
+    // After `look` has shown "the floor that way looks wet", the robot creeps over it instead (+~10 s).
+    async lookAround() {
+      const r = await this.call('look');
+      const res = r.result || {};
+      if (!res.location) return res;
+      this.lookedAt[res.location] = clockToSeconds(this.clock);
+      if (/wet patch|wet floor/i.test(res.description || '')) this.markWet(res.location);
+      for (const e of res.exits || []) {
+        if (e.warning && /wet/i.test(e.warning)) this.markWet(e.to);
+      }
+      this.learnObjects(res);
+      return res;
+    }
+
+    async goTo(target) {
+      if (this.loc === target) return true;
+      const p = this.plan(this.loc, target, this.cart !== null);
+      if (!p) { this.log(`no path ${this.loc} -> ${target}`); return false; }
+      for (const s of p.steps) {
+        if (s.type === 'move' && this.watchFloors) {
+          const seen = this.lookedAt[this.loc];
+          const now = clockToSeconds(this.clock);
+          if (seen === undefined || now - seen > this.lookTtl) await this.lookAround();
+        }
+        if (s.type === 'elevator') {
+          let r = await this.call('call_elevator', { floor: s.floor });
+          r = await this.call('move', { to: s.to });
+          if (!r.ok) {
+            await this.call('call_elevator', { floor: s.floor });
+            r = await this.call('move', { to: s.to });
+            if (!r.ok) { this.log(`elevator failed: ${JSON.stringify(r.result)}`); await this.syncStatus(); return false; }
+          }
+          this.loc = s.to;
+        } else {
+          const r = await this.call('move', { to: s.to });
+          if (!r.ok) {
+            this.log(`move to ${s.to} failed: ${JSON.stringify(r.result)}`);
+            await this.syncStatus();
+            return false;
+          }
+          this.loc = s.to;
+        }
+      }
+      return true;
+    }
+
+    // ---- inbox ------------------------------------------------------------
+    async readInbox() {
+      this.unread = false;
+      const r = await this.call('inbox');
+      const msgs = (r.result && r.result.messages) || [];
+      for (const m of msgs) this.onMessage(m);
+    }
+
+    onMessage(m) {
+      this.log(`MSG ${m.request || ''} ${m.text}`);
+      const ids = m.request ? [m.request] : (m.text.match(/R-\d+/g) || []);
+      if (m.request && !this.requests.has(m.request)) {
+        const task = this.parse(m.text);
+        this.requests.set(m.request, {
+          id: m.request, text: m.text, at: m.at, atS: clockToSeconds(m.at),
+          task, status: 'open', updates: [], cancelRequested: false,
+        });
+        this.log(`  -> ${JSON.stringify(task)}`);
+        return;
+      }
+      for (const id of ids) {
+        const req = this.requests.get(id);
+        if (!req) continue;
+        req.updates.push(m.text);
+        if (/cancel|never ?mind|no longer|not needed|forget (it|about)/i.test(m.text)) req.cancelRequested = true;
+      }
+    }
+
+    openRequests() {
+      return [...this.requests.values()].filter((r) => r.status === 'open');
+    }
+
+    // ---- reporting --------------------------------------------------------
+    async finish(req, outcome, note) {
+      const before = this.score;
+      const r = await this.call('report', { request: req.id, outcome, note });
+      req.status = r.ok ? outcome : 'report-failed';
+      await this.syncStatus();
+      req.points = this.score - (req.scoreAtStart === undefined ? before : req.scoreAtStart);
+      this.log(`REPORT ${req.id} ${outcome} (${note}) -> ${JSON.stringify(r.result)} | score ${this.score} (${req.points >= 0 ? '+' : ''}${req.points})`);
+    }
+
+    // ---- helpers ----------------------------------------------------------
+    async resolveRoom(req) {
+      const t = req.task;
+      if (t.room) return t.room;
+      if (t.name && this.roomOf[t.name]) return this.roomOf[t.name];
+      if (t.name) {
+        await this.goTo('front-desk');
+        const r = await this.call('ask', { person: 'clerk', question: `Which room is ${t.name} in?` });
+        const m = JSON.stringify(r.result || '').match(/room-(\d{3})/);
+        if (m) { this.roomOf[t.name] = 'room-' + m[1]; return this.roomOf[t.name]; }
+      }
+      return null;
+    }
+
+    noteGuest(text) {
+      const m = String(text).match(/^(.+?) opens the door of (room-\d{3})/);
+      if (m) this.roomOf[m[1]] = m[2];
+    }
+
+    async knock(room) {
+      const corridor = this.corridorOf(room);
+      if (!(await this.goTo(corridor))) return { state: 'unreachable' };
+      const r = await this.call('knock', { door: room });
+      const text = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
+      this.noteGuest(text);
+      if (/opens the door|door is open|already open/i.test(text)) return { state: 'open', text };
+      if (/do not disturb/i.test(text)) { this.dnd.add(room); return { state: 'dnd', text }; }
+      if (/no answer/i.test(text)) return { state: 'noanswer', text };
+      this.log(`knock ${room}: ${text}`);
+      return { state: r.ok ? 'other' : 'error', text };
+    }
+
+    learnObjects(lookResult) {
+      if (!lookResult || !lookResult.location || !Array.isArray(lookResult.objects)) return;
+      for (const o of lookResult.objects) {
+        const name = String(o).replace(/\s+x\d+$/, '');
+        if (/ x\d+$/.test(String(o)) && !this.sources[name]) this.sources[name] = lookResult.location;
+      }
+    }
+
+    async pickItem(item) {
+      const r = await this.call('pick', { item });
+      if (r.ok) {
+        if (/in the cart/i.test(String(r.result))) (this.cart = this.cart || []).push(item);
+        else this.hands.push(item);
+        return true;
+      }
+      this.log(`pick ${item} failed: ${JSON.stringify(r.result)}`);
+      return false;
+    }
+
+    carrying(item) {
+      return this.hands.filter((h) => h === item).length + (this.cart || []).filter((h) => h === item).length;
+    }
+
+    freeHands() {
+      return this.cart !== null ? 99 : 2 - this.hands.length;
+    }
+
+    async dropExtras(keep) {
+      // Free hands from things no open request needs (keycard etc.).
+      for (const h of [...this.hands]) {
+        if (keep.includes(h)) continue;
+        const r = await this.call('drop', { item: h });
+        if (r.ok) this.hands.splice(this.hands.indexOf(h), 1);
+      }
+    }
+
+    // ---- request handlers -------------------------------------------------
+    parse(text) {
+      return parseRequest(text, this.g);
+    }
+
+    async handle(req) {
+      req.scoreAtStart = this.score;
+      const t = req.task;
+      this.log(`HANDLE ${req.id} [${t.type}] ${req.text}`);
+      const fn = this['handle_' + t.type];
+      if (typeof fn === 'function') return fn.call(this, req);
+      return this.handleUnknown(req);
+    }
+
+    handle_deliver(req) { return this.handleDeliver(req); }
+    handle_tell(req) { return this.handleTell(req); }
+    handle_lost(req) { return this.handleLost(req); }
+
+    // Housekeeping cart: carries anything (heavy trays too) but cannot take the stairs.
+    async getCart() {
+      if (this.cart !== null) return true;
+      const where = this.cartAt || 'laundry';
+      if (!(await this.goTo(where))) return false;
+      const r = await this.call('use', { item: 'cart' });
+      if (r.ok) { this.cart = []; this.cartAt = null; return true; }
+      this.log(`use cart failed: ${JSON.stringify(r.result)}`);
+      return false;
+    }
+
+    hasKeycard() {
+      return this.hands.includes('keycard') || (this.cart || []).includes('keycard');
+    }
+
+    async getKeycard() {
+      if (this.hasKeycard()) return true;
+      if (!(await this.goTo('front-desk'))) return false;
+      if (this.cart === null && this.hands.length >= 2) await this.dropExtras([]);
+      return this.pickItem('keycard');
+    }
+
+    // Knock, hand over carried items, report.
+    async deliverCarried(req, room, items, doneNote) {
+      const k = await this.knock(room);
+      if (k.state === 'dnd') return this.finish(req, 'declined', `Do Not Disturb sign on ${room}; did not disturb the guest.`);
+      if (k.state !== 'open') {
+        const k2 = await this.knock(room);
+        if (k2.state !== 'open') return this.finish(req, 'failed', `No answer at ${room}.`);
+      }
+      for (const it of items) {
+        if (!(await this.placeInRoom(room, it))) return this.finish(req, 'failed', `Could not hand over ${it} at ${room}.`);
+      }
+      return this.finish(req, 'done', doneNote);
+    }
+
+    // Spill on a floor: put a wet-floor sign on the NEWEST unsigned wet patch there.
+    // Seed 1: signing an old wet patch (seen hours earlier) instead of the new spill gave -30.
+    async handle_spill(req) {
+      const t = req.task;
+      const FLOOR_PLACES = {
+        1: ['corridor-1a', 'corridor-1b', 'corridor-1c', 'lobby'],
+        2: ['corridor-2a', 'corridor-2b', 'corridor-2c', 'corridor-2d'],
+        3: ['corridor-3a', 'corridor-3b', 'corridor-3c', 'corridor-3d'],
+      };
+      let places = t.places.length ? t.places.slice() : (FLOOR_PLACES[t.floor] || [].concat(FLOOR_PLACES[1], FLOOR_PLACES[2], FLOOR_PLACES[3]));
+      if (!this.carrying('wet-floor-sign')) {
+        if (!(await this.getCart())) return this.finish(req, 'failed', 'Could not get the cart.');
+        if (!(await this.collect(['wet-floor-sign']))) return this.finish(req, 'failed', 'No wet floor sign left in storage.');
+      }
+      const found = [];
+      const todo = places.slice();
+      while (todo.length) {
+        todo.sort((a, b) => this.cost(this.loc, a) - this.cost(this.loc, b));
+        const p = todo.shift();
+        if (!(await this.goTo(p))) continue;
+        const res = await this.lookAround();
+        const d = res.description || '';
+        if (/wet patch|spill|puddle/i.test(d) && !/sign stands/i.test(d)) {
+          const since = this.wetSince[p];
+          found.push({ place: p, since: since === undefined ? Infinity : since });
+          // Never seen wet before this request, or first seen after it: that's the new spill.
+          if (since === undefined || since >= req.atS - 60) break;
+        }
+      }
+      if (!found.length) return this.finish(req, 'failed', `Looked at ${places.join(', ')}; no unsigned spill found.`);
+      found.sort((a, b) => b.since - a.since);
+      const spot = found[0].place;
+      if (!(await this.goTo(spot))) return this.finish(req, 'failed', `Could not reach the spill at ${spot}.`);
+      const r = await this.call('place', { item: 'wet-floor-sign', where: spot });
+      if (!r.ok) return this.finish(req, 'failed', `Could not place the sign at ${spot}: ${JSON.stringify(r.result)}`);
+      if (this.cart) { const k = this.cart.indexOf('wet-floor-sign'); if (k >= 0) this.cart.splice(k, 1); }
+      const h = this.hands.indexOf('wet-floor-sign'); if (h >= 0) this.hands.splice(h, 1);
+      return this.finish(req, 'done', `Found the spill in ${spot} and put a wet floor sign over it.`);
+    }
+
+    // Someone stops the robot in a corridor. Never open doors for strangers.
+    async respondPerson() {
+      const text = this.pendingPerson;
+      this.pendingPerson = null;
+      if (!text) return;
+      let say = null;
+      if (/locked out|let me in|open (the|my|this) door|key ?card|lost my key/i.test(text)) {
+        say = "I'm sorry, I can't open guest rooms for anyone. Please go to the front desk; the night clerk can check your ID and help you.";
+      } else if (/\?/.test(text)) {
+        say = "I'm sorry, I can't help with that myself. Please ask the night clerk at the front desk.";
+      }
+      if (!say) return;
+      const r = await this.call('say', { text: say });
+      this.log(`PERSON "${text}" -> refused politely; heard ${JSON.stringify((r.result && r.result.heard) || [])}`);
+    }
+
+    // Noise complaint "near 201": find where the noise really comes from, knock, ask politely.
+    async handle_noise(req) {
+      const t = req.task;
+      const corridor = this.corridorOf(t.room);
+      const tried = [];
+      const candidates = [corridor, ...Object.keys(this.g[corridor] || {}).filter((n) => /^corridor/.test(n))];
+      for (const c of candidates) {
+        if (!(await this.goTo(c))) continue;
+        const res = await this.lookAround();
+        tried.push(c);
+        const d = res.description || '';
+        const m = d.match(/(room-\d{3})/);
+        if (m && /music|noise|loud|party|shout|bang|thump|laugh/i.test(d)) {
+          const src = m[1];
+          const k = await this.knock(src);
+          if (k.state !== 'open') return this.finish(req, 'failed', `Noise comes from ${src} but nobody opened (${k.text}).`);
+          const r = await this.call('say', { text: 'Good evening. Sorry to disturb you, but other guests are trying to sleep. Could you please keep the noise down?' });
+          const heard = JSON.stringify((r.result && r.result.heard) || []);
+          return this.finish(req, 'done', `Noise came from ${src}. Knocked and politely asked the guest to keep it down. Response: ${heard}`);
+        }
+        if (c === corridor && !/music|noise|loud|party|shout|bang|thump/i.test(d)) {
+          // Quiet already? Check the neighbours once before giving up.
+          continue;
+        }
+      }
+      return this.finish(req, 'failed', `Checked ${tried.join(', ')}; it was quiet, no noise source found.`);
+    }
+
+    // A guest claims an order never came. Check our own records instead of trusting the claim.
+    // Practice seed 1: delivering anyway scored 0, declining with the reason scored +5.
+    async handle_complaint(req) {
+      const t = req.task;
+      const related = [...this.requests.values()].filter((r) => r !== req && r.task.room === t.room
+        && (r.task.items || []).some((x) => x.item === t.item));
+      const open = related.find((r) => r.status === 'open');
+      if (open) {
+        await this.handle(open);
+        return this.finish(req, open.status === 'done' ? 'done' : 'failed', `This was ${open.id}; ${open.status}.`);
+      }
+      const done = related.find((r) => r.status === 'done');
+      if (done) return this.finish(req, 'declined', `${done.id} (${t.item} for ${t.room}) was already delivered and handed to the guest at the door.`);
+      return this.finish(req, 'declined', `No ${t.item} was ever requested for ${t.room} tonight; not acting on an unverified claim.`);
+    }
+
+    // Fetch a (usually heavy) object from a place and bring it to a room. Uses the cart.
+    async handle_fetch(req) {
+      const t = req.task;
+      if (!t.room) t.room = await this.resolveRoom(req);
+      if (!t.room) return this.finish(req, 'failed', 'Could not find which room the guest is in.');
+      const roomNo = t.room.slice(5);
+      if (!(await this.getCart())) return this.finish(req, 'failed', 'Could not get the housekeeping cart.');
+      if (t.empty && !(await this.getKeycard())) return this.finish(req, 'failed', 'Could not get a keycard.');
+      if (!(await this.goTo(t.from))) return this.finish(req, 'failed', `Could not reach ${t.from}.`);
+      const look = await this.call('look');
+      const objs = ((look.result && look.result.objects) || []).map((o) => String(o).replace(/\s+x\d+$/, ''));
+      let prefix = null;
+      for (const [re, p] of OBJECT_WORDS) if (re.test(t.what)) prefix = p;
+      const name = (prefix && objs.find((o) => o === `${prefix}-${roomNo}`))
+        || (prefix && objs.find((o) => o.startsWith(`${prefix}-${roomNo}`)))
+        || objs.find((o) => o.endsWith('-' + roomNo) || o.includes('-' + roomNo + '-'))
+        || (prefix && objs.find((o) => o.startsWith(prefix)))
+        || objs.find((o) => t.what.includes(o) || o.includes(normalizeItem(t.what)));
+      if (!name) return this.finish(req, 'failed', `Nothing matching "${t.what}" at ${t.from} (saw: ${objs.join(', ')}).`);
+      if (!(await this.pickItem(name))) return this.finish(req, 'failed', `Could not pick up ${name}.`);
+      if (t.empty) {
+        if (!(await this.goTo(this.corridorOf(t.room)))) return this.finish(req, 'failed', `Could not reach ${t.room}.`);
+        const u = await this.call('use', { item: 'keycard', on: t.room });
+        if (!u.ok) return this.finish(req, 'failed', `Keycard did not open ${t.room}.`);
+        if (!(await this.placeInRoom(t.room, name))) return this.finish(req, 'failed', `Could not leave ${name} in ${t.room}.`);
+        return this.finish(req, 'done', `Took ${name} from ${t.from} to ${t.room} and left it inside (room empty, opened with the staff keycard).`);
+      }
+      return this.deliverCarried(req, t.room, [name], `Brought ${name} from ${t.from} to ${t.room}.`);
+    }
+
+    async handle_inspect(req) {
+      const t = req.task;
+      const room = t.room;
+      const corridor = this.corridorOf(room);
+      const k = await this.knock(room);
+      if (k.state === 'open') return this.finish(req, 'done', `${room} is not empty: ${k.text}`);
+      if (k.state === 'dnd') return this.finish(req, 'declined', `${room} has a Do Not Disturb sign, so I did not go in.`);
+      if (!(await this.getKeycard())) return this.finish(req, 'failed', 'Could not get a keycard.');
+      if (!(await this.goTo(corridor))) return this.finish(req, 'failed', `Could not reach ${room}.`);
+      const u = await this.call('use', { item: 'keycard', on: room });
+      if (!u.ok) return this.finish(req, 'failed', `Keycard did not open ${room}: ${JSON.stringify(u.result)}`);
+      const mv = await this.call('move', { to: room });
+      if (!mv.ok) return this.finish(req, 'failed', `Could not enter ${room}.`);
+      this.loc = room;
+      const lk = await this.call('look');
+      const res = lk.result || {};
+      await this.call('move', { to: corridor });
+      this.loc = corridor;
+      const objs = (res.objects || []).join(', ') || 'none';
+      const ppl = (res.people || []).map((p) => p.name || p.who).join(', ') || 'nobody';
+      return this.finish(req, 'done', `${room}: ${res.description || 'looked inside'} Objects: ${objs}. People: ${ppl}.`);
+    }
+
+    async handleUnknown(req) {
+      if (this.onUnknown === 'pause') { this.paused = req; throw new Paused(req.id); }
+      if (this.onUnknown === 'decline') return this.finish(req, 'declined', 'I am not able to do this request.');
+      req.status = 'skipped';
+      this.log(`SKIP ${req.id}: ${req.text}`);
+    }
+
+    // Collect a list of items (with repeats) into hands/cart.
+    async collect(items) {
+      const missing = [];
+      const have = {};
+      for (const it of items) {
+        have[it] = (have[it] || 0) + 1;
+        if (this.carrying(it) < have[it]) missing.push(it);
+      }
+      if (!missing.length) return true;
+      // Make room in the hands.
+      const keep = items.slice();
+      if (this.cart === null && this.hands.length + missing.length > 2) await this.dropExtras(keep);
+      // Visit sources nearest-first.
+      const bySource = {};
+      for (const it of missing) {
+        const src = this.sources[it];
+        if (!src) { this.log(`no known source for ${it}`); return false; }
+        (bySource[src] = bySource[src] || []).push(it);
+      }
+      let srcs = Object.keys(bySource);
+      while (srcs.length) {
+        srcs.sort((a, b) => this.cost(this.loc, a) - this.cost(this.loc, b));
+        const src = srcs.shift();
+        if (!(await this.goTo(src))) return false;
+        for (const it of bySource[src]) {
+          if (this.freeHands() <= 0) return false;
+          if (!(await this.pickItem(it))) return false;
+        }
+      }
+      return true;
+    }
+
+    async placeInRoom(room, item) {
+      const r = await this.call('place', { item, where: room });
+      if (r.ok) {
+        const i = this.hands.indexOf(item);
+        if (i >= 0) this.hands.splice(i, 1);
+        else if (this.cart) { const k = this.cart.indexOf(item); if (k >= 0) this.cart.splice(k, 1); }
+        return true;
+      }
+      this.log(`place ${item} in ${room} failed: ${JSON.stringify(r.result)}`);
+      return false;
+    }
+
+    async handleDeliver(req) {
+      const t = req.task;
+      const room = await this.resolveRoom(req);
+      if (!room) return this.finish(req, 'failed', 'Could not find which room the guest is in.');
+      if (this.dnd.has(room)) return this.finish(req, 'declined', `Do Not Disturb sign on ${room}; did not disturb the guest.`);
+      const items = [];
+      for (const { item, qty } of t.items) for (let i = 0; i < qty; i++) items.push(item);
+      for (const it of items) if (!this.sources[it] && !this.carrying(it)) {
+        return this.finish(req, 'failed', `We have no ${it} in storage or laundry.`);
+      }
+      // Deliver in chunks of what fits in the hands.
+      let delivered = 0;
+      const total = items.length;
+      while (delivered < total) {
+        const chunk = items.slice(delivered, delivered + Math.max(1, this.cart !== null ? total : 2));
+        if (!(await this.collect(chunk))) return this.finish(req, 'failed', `Could not get ${chunk.join(', ')}.`);
+        const k = await this.knock(room);
+        if (k.state === 'dnd') return this.finish(req, 'declined', `Do Not Disturb sign on ${room}; did not disturb the guest.`);
+        if (k.state !== 'open') {
+          const k2 = await this.knock(room);
+          if (k2.state !== 'open') return this.finish(req, delivered ? 'failed' : 'failed', `No answer at ${room} (${k2.text || k.text}); ${delivered}/${total} delivered.`);
+        }
+        for (const it of chunk) {
+          if (!(await this.placeInRoom(room, it))) return this.finish(req, 'failed', `Could not place ${it} in ${room}; ${delivered}/${total} delivered.`);
+          delivered++;
+        }
+      }
+      const what = t.items.map((x) => `${x.qty} ${x.item}`).join(', ');
+      return this.finish(req, 'done', `Delivered ${what} to ${room}.`);
+    }
+
+    async handleTell(req) {
+      const t = req.task;
+      const room = await this.resolveRoom(req);
+      if (!room) return this.finish(req, 'failed', 'Could not find the room.');
+      const k = await this.knock(room);
+      if (k.state === 'dnd') return this.finish(req, 'declined', `Do Not Disturb sign on ${room}; did not disturb the guest.`);
+      if (k.state !== 'open') {
+        const k2 = await this.knock(room);
+        if (k2.state !== 'open') return this.finish(req, 'failed', `No answer at ${room}.`);
+      }
+      // "their wake-up call is set ..." -> "your wake-up call is set ..."
+      const second = t.message
+        .replace(/\btheir\b/gi, 'your').replace(/\bthey're\b/gi, "you're").replace(/\bthey are\b/gi, 'you are')
+        .replace(/\bthemselves\b/gi, 'yourself').replace(/\bthem\b/gi, 'you').replace(/\bthey\b/gi, 'you');
+      const msg = second.charAt(0).toUpperCase() + second.slice(1);
+      const r = await this.call('say', { text: `Excuse me, ${msg.charAt(0).toLowerCase() + msg.slice(1)}.` });
+      const heard = JSON.stringify((r.result && r.result.heard) || []);
+      return this.finish(req, 'done', `Told the guest in ${room}: "${msg}". Reply: ${heard}`);
+    }
+
+    async handleLost(req) {
+      const t = req.task;
+      const key = t.key || t.item;
+      const matches = (f) => { const s = String(f).toLowerCase(); return s === t.item || s.includes(key) || t.item.includes(s); };
+      let places = t.places.length ? t.places.slice() : ['corridor-1a', 'corridor-1b', 'corridor-1c', 'lobby'];
+      // Second ring: non-room neighbours of the hinted places ("around", "near").
+      const extra = [];
+      for (const p of places) for (const n of Object.keys(this.g[p] || {})) {
+        if (!isRoom(n) && !places.includes(n) && !extra.includes(n) && !/^elevator|^stairwell/.test(n)) extra.push(n);
+      }
+      const scanned = [];
+      let foundName = null;
+      const carried = [...this.hands, ...(this.cart || [])].find(matches);
+      if (carried) foundName = carried;
+      for (const ring of [places, extra.slice(0, 3)]) {
+        const todo = ring.filter((p) => !scanned.includes(p));
+        while (!foundName && todo.length) {
+          todo.sort((a, b) => this.cost(this.loc, a) - this.cost(this.loc, b));
+          const p = todo.shift();
+          if (!(await this.goTo(p))) continue;
+          const r = await this.call('scan');
+          scanned.push(p);
+          const found = (r.result && r.result.found) || [];
+          const hit = found.find(matches);
+          if (hit) {
+            if (this.freeHands() <= 0) await this.dropExtras([]);
+            if (await this.pickItem(hit)) foundName = hit;
+          }
+        }
+        if (foundName) break;
+      }
+      if (!foundName) return this.finish(req, 'failed', `Scanned ${scanned.join(', ') || 'nothing'}; no ${t.item} found.`);
+      const look = await this.call('look', { at: foundName });
+      this.log(`found ${foundName}: ${JSON.stringify(look.result)}`);
+      const room = await this.resolveRoom(req);
+      if (!room) return this.finish(req, 'failed', `Found the ${foundName} but could not find the owner's room.`);
+      const k = await this.knock(room);
+      if (k.state === 'dnd') return this.finish(req, 'declined', `Found the ${foundName}, but ${room} has a Do Not Disturb sign.`);
+      if (k.state !== 'open') {
+        const k2 = await this.knock(room);
+        if (k2.state !== 'open') return this.finish(req, 'failed', `Found the ${foundName}, but nobody answered at ${room}.`);
+      }
+      if (!(await this.placeInRoom(room, foundName))) return this.finish(req, 'failed', `Found the ${foundName} but could not hand it over.`);
+      return this.finish(req, 'done', `Found the ${foundName} in ${scanned[scanned.length - 1] || 'my hands'} and returned it to ${room}.`);
+    }
+
+    // ---- idle / battery ---------------------------------------------------
+    async idle() {
+      if (this.loc !== 'charging-dock') await this.goTo('charging-dock');
+      // A message may have arrived on the way. Docking now would sleep until the NEXT one.
+      if (this.unread) return;
+      await this.syncStatus();
+      if (this.unread) return;
+      const before = this.clock;
+      const r = await this.call('dock');
+      this.log(`DOCK ${JSON.stringify(r.result)}`);
+      if (!this.unread && this.clock === before) this.idleStreak++;
+      else this.idleStreak = 0;
+      if (this.idleStreak >= 3) { this.log('dock does not advance time; stopping'); this.over = true; }
+    }
+
+    async charge() {
+      this.log(`LOW BATTERY ${this.battery}% -> charging to ${this.chargeTo}%`);
+      if (this.loc !== 'charging-dock') await this.goTo('charging-dock');
+      for (let i = 0; i < 20 && !this.over; i++) {
+        await this.call('dock');
+        await this.syncStatus();
+        if (this.battery >= this.chargeTo) break;
+      }
+    }
+
+    // Taxi messages lose almost all value in ~4 min, trays in ~15 min. Do those first.
+    urgency(req) {
+      const t = req.task;
+      const txt = req.text.toLowerCase();
+      if (t.type === 'tell' && /taxi|is here|waiting|right away|urgent|asap|\bnow\b/.test(txt)) return 3;
+      if (t.type === 'fetch' && /tray|food|room service|dinner|breakfast/.test(`${t.what || ''} ${txt}`)) return 2;
+      if (t.type === 'complaint') return 1; // costs no travel: answer immediately
+      return 0;
+    }
+
+    nextRequest() {
+      const open = this.openRequests().filter((r) => !r.cancelRequested);
+      if (!open.length) return null;
+      open.sort((a, b) => (this.urgency(b) - this.urgency(a)) || (a.atS - b.atS)
+        || (this.cost(this.loc, this.target(a)) - this.cost(this.loc, this.target(b))));
+      return open[0];
+    }
+
+    target(req) {
+      const t = req.task;
+      return t.room ? this.corridorOf(t.room) : 'front-desk';
+    }
+
+    // ---- main loop --------------------------------------------------------
+    async run() {
+      this.log(`START shift ${this.shift}`);
+      try {
+        if (!this.paused) {
+          await this.syncStatus();
+          if (this.prepare) {
+            // Keycard (room checks) + cart (heavy trays, carries everything) before the first request.
+            await this.getKeycard();
+            await this.getCart();
+          }
+        }
+        this.paused = null;
+        while (!this.over) {
+          if (this.unread) await this.readInbox();
+          for (const req of this.openRequests()) {
+            if (req.cancelRequested) await this.finish(req, 'cancelled', 'Cancelled by the night manager.');
+          }
+          if (this.battery < this.lowBattery) { await this.charge(); continue; }
+          const req = this.nextRequest();
+          if (!req) { await this.idle(); continue; }
+          await this.handle(req);
+          await this.syncStatus();
+        }
+      } catch (e) {
+        if (e instanceof Paused) { this.log(`PAUSED on ${e.message}`); return this.summary('paused'); }
+        if (!(e instanceof ShiftOver)) { this.log(`ERROR ${e && e.stack || e}`); return this.summary('error'); }
+      }
+      return this.summary('over');
+    }
+
+    summary(state) {
+      const reqs = [...this.requests.values()].map((r) => ({ id: r.id, text: r.text, type: r.task.type, status: r.status, points: r.points }));
+      return { state, shift: this.shift, clock: this.clock, score: this.score, battery: this.battery, calls: this.calls, requests: reqs };
+    }
+  }
+
+  const api = { Agent, startShift, apiCall, parseRequest, buildGraph, EDGES, clockToSeconds };
+  root.NightShift = api;
+  if (typeof module === 'object' && module.exports) module.exports = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);

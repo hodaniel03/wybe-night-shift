@@ -1,0 +1,14 @@
+{
+  "name": "wybe-night-shift",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agent for Wybe Night Shift (Oslo Sprint 2026) – team Ghosts",
+  "main": "src/agent.js",
+  "scripts": {
+    "practice": "node run.js",
+    "final": "node run.js --mode final --count 10 --yes"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
