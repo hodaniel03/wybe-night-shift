@@ -86,7 +86,7 @@ async function startWithRetry({ key, base, mode, seed, retryForMs }) {
       return await startShift({ key, base, mode, seed });
     } catch (e) {
       const msg = String(e.message || e);
-      if (/no more|all .*started|already started|limit/i.test(msg) || Date.now() > until) throw e;
+      if (/no more|all .*started|already started|limit|already running|end one first/i.test(msg) || Date.now() > until) throw e;
       console.error(`start_shift feilet (${msg.slice(0, 160)}), prøver igjen om 3 s`);
       await sleep(3000);
     }
@@ -171,23 +171,56 @@ async function main() {
     if (fs.existsSync(args.resume)) infos = JSON.parse(fs.readFileSync(args.resume, 'utf8'));
     else infos = args.resume.split(',').map((s) => ({ shift: s.trim(), mode: args.mode }));
     console.log(`Fortsetter ${infos.length} skift: ${infos.map((i) => i.shift.slice(-8)).join(', ')}`);
-  } else {
+  } else if (args.parallel) {
+    // Start shifts and run them as they start. Practice allows 4 live shifts per team, so a "busy" answer
+    // just means: wait until one of ours finishes, then start the next.
     if (args.waitUntil) await waitUntil(args.waitUntil);
-    const n = args.parallel || 1;
+    const n = args.parallel;
     const listFile = path.join(logsDir, `${stamp}-${args.mode}-shifts.json`);
-    for (let i = 0; i < n; i++) {
-      const seed = args.mode === 'practice' && args.seed !== undefined ? args.seed + i : undefined;
-      try {
-        const info = await startWithRetry({ key, base, mode: args.mode, seed, retryForMs: args.mode === 'final' ? 10 * 60 * 1000 : 15000 });
+    console.log(`Skiftliste: ${path.relative(process.cwd(), listFile)}  (bruk --resume på denne hvis noe krasjer)`);
+    const limiter = new RateLimiter({ rate: 40, burst: 20 });
+    const running = new Set();
+    const results = [];
+    let next = 0;
+    let stop = false;
+    const t0 = Date.now();
+    const ticker = setInterval(() => console.log(`[${((Date.now() - t0) / 60000).toFixed(1)} min] ${running.size} kjører, ${results.length}/${n} ferdige`), 30000);
+    while ((next < n && !stop) || running.size) {
+      if (next < n && !stop) {
+        const seed = args.mode === 'practice' && args.seed !== undefined ? args.seed + next : undefined;
+        let info = null;
+        try {
+          info = await startWithRetry({ key, base, mode: args.mode, seed, retryForMs: args.mode === 'final' ? 10 * 60 * 1000 : 15000 });
+        } catch (e) {
+          const msg = String(e.message || e);
+          if (/already running|end one first/i.test(msg) && running.size) { await Promise.race(running); continue; }
+          if (/already running|end one first/i.test(msg)) { console.error('Serveren sier at for mange skift kjører (ikke våre). Venter 10 s.'); await sleep(10000); continue; }
+          console.error(`\n!!! Kunne ikke starte skift ${next + 1}: ${msg}\n`);
+          if (args.mode === 'final') console.error('!!! Et finaleskift som aldri startes gir 0. Kjør samme finale-kommando igjen for å starte resten.');
+          stop = true;
+          continue;
+        }
         infos.push(info);
         writeAtomic(listFile, infos); // saved at once, so --resume works even if we crash right now
-        console.log(`Startet ${args.mode}-skift ${i + 1}/${n}: ${info.shift}${info.seed !== undefined ? ` (seed ${info.seed})` : ''}`);
-      } catch (e) {
-        console.error(`\n!!! Kunne ikke starte skift ${i + 1}: ${e.message || e}\n`);
-        if (args.mode === 'final') console.error('!!! Et finaleskift som aldri startes gir 0. Kjør samme kommando igjen for å starte resten.');
+        next++;
+        console.log(`Startet ${args.mode}-skift ${next}/${n}: ${info.shift}${info.seed !== undefined ? ` (seed ${info.seed})` : ''}`);
+        const p = runOne({ key, base, info, args, logsDir, stamp, limiter, quiet: true })
+          .catch((e) => ({ info, summary: { state: 'crash', score: 0, error: String(e) } }))
+          .then((r) => { results.push(r); running.delete(p); });
+        running.add(p);
+        continue;
       }
+      await Promise.race(running);
     }
-    console.log(`Skiftliste lagret: ${path.relative(process.cwd(), listFile)}  (bruk --resume på denne hvis noe krasjer)`);
+    clearInterval(ticker);
+    results.sort((a, b) => infos.indexOf(a.info) - infos.indexOf(b.info));
+    printTable(results);
+    if (limiter.throttled) console.log(`(Serveren ba oss senke farten ${limiter.throttled} ganger.)`);
+    return;
+  } else {
+    if (args.waitUntil) await waitUntil(args.waitUntil);
+    infos.push(await startWithRetry({ key, base, mode: args.mode, seed: args.seed, retryForMs: args.mode === 'final' ? 10 * 60 * 1000 : 15000 }));
+    writeAtomic(path.join(logsDir, `${stamp}-${args.mode}-shifts.json`), infos);
   }
   if (!infos.length) { console.error('Ingen skift å kjøre.'); process.exit(1); }
 
