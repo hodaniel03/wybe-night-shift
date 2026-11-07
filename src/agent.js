@@ -236,32 +236,64 @@
 
   class ShiftOver extends Error {}
   class Paused extends Error {}
+  class Cancelled extends Error {}
+
+  // Shared by all agents in one process (the final runs 10 shifts in parallel).
+  class RateLimiter {
+    constructor({ rate = 40, burst = 20 } = {}) {
+      this.rate = rate; this.burst = burst; this.tokens = burst; this.last = Date.now();
+      this.queue = Promise.resolve(); this.throttled = 0;
+    }
+    take() {
+      const turn = this.queue.then(async () => {
+        for (;;) {
+          const now = Date.now();
+          this.tokens = Math.min(this.burst, this.tokens + ((now - this.last) / 1000) * this.rate);
+          this.last = now;
+          if (this.tokens >= 1) { this.tokens -= 1; return; }
+          await sleep(Math.ceil(((1 - this.tokens) / this.rate) * 1000));
+        }
+      });
+      this.queue = turn.catch(() => {});
+      return turn;
+    }
+    onThrottle() { this.throttled++; this.rate = Math.max(2, this.rate * 0.7); this.tokens = 0; }
+  }
 
   // ---------------------------------------------------------------------------
   // Raw API call (no shift header), used for start_shift / shifts / whoami.
   // ---------------------------------------------------------------------------
-  async function apiCall({ key, base = DEFAULT_BASE, shift = null, cmd, args }) {
-    let wait = 600;
-    for (let attempt = 0; attempt < 12; attempt++) {
+  async function apiCall({ key, base = DEFAULT_BASE, shift = null, cmd, args, limiter = null, timeoutMs = 15000 }) {
+    let wait = 500;
+    for (let attempt = 0; attempt < 15; attempt++) {
       const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' };
       if (shift) headers['X-Shift'] = shift;
+      if (limiter) await limiter.take();
       let res, text;
+      const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
       try {
-        res = await fetch(base, { method: 'POST', headers, body: JSON.stringify(args === undefined ? { cmd } : { cmd, args }) });
+        res = await fetch(base, { method: 'POST', headers, body: JSON.stringify(args === undefined ? { cmd } : { cmd, args }), signal: ctrl ? ctrl.signal : undefined });
         text = await res.text();
       } catch (e) {
-        await sleep(wait); wait = Math.min(wait * 2, 8000); continue;
+        // Network hiccup or timeout: wait a little and try again (max 4 s, the robot idles after 20 s).
+        if (timer) clearTimeout(timer);
+        await sleep(wait); wait = Math.min(wait * 2, 4000); continue;
       }
+      if (timer) clearTimeout(timer);
       let j;
-      try { j = JSON.parse(text); } catch (e) { j = { ok: false, result: text }; }
+      try { j = JSON.parse(text); } catch (e) { j = null; }
+      // 5xx or a non-JSON page (proxy/gateway error) is not an answer from the game: try again.
+      if (res.status >= 500 || !j) { await sleep(wait); wait = Math.min(wait * 2, 4000); continue; }
       const r = typeof j.result === 'string' ? j.result : '';
       if (res.status === 429 || /too many requests|slow down/i.test(r)) {
-        await sleep(wait); wait = Math.min(wait * 2, 8000); continue;
+        if (limiter) limiter.onThrottle();
+        await sleep(wait); wait = Math.min(wait * 2, 4000); continue;
       }
       j._status = res.status;
       return j;
     }
-    throw new Error('Rate limited for too long');
+    throw new Error('No answer from the server after 15 tries');
   }
 
   async function startShift({ key, base = DEFAULT_BASE, mode = 'practice', seed }) {
@@ -299,6 +331,12 @@
       this.blockTtl = opts.blockTtl || 600;
       this.verified = {}; // corridors whose doors we have seen tonight
       this.foundFor = {}; // lost item name -> request id it was found for
+      this.limiter = opts.limiter || null;
+      this.onSave = opts.onSave || null;
+      this.errors = 0;
+      this.current = null;
+      this.lastActionAt = 0;
+      this.maxActionGapMs = 0;
       this.parkCart = opts.parkCart === undefined ? true : opts.parkCart;
 
       this.g = buildGraph(EDGES);
@@ -334,8 +372,25 @@
       const gap = Date.now() - this.lastCallAt;
       if (gap < this.minGapMs) await sleep(this.minGapMs - gap);
       this.lastCallAt = Date.now();
-      const j = await apiCall({ key: this.key, base: this.base, shift: this.shift, cmd, args });
+      const j = await apiCall({ key: this.key, base: this.base, shift: this.shift, cmd, args, limiter: this.limiter });
       this.calls++;
+      // Final rule: 20 s per action (status/inbox do not count). Track the worst gap we produced.
+      if (!['status', 'inbox', 'report', 'reply', 'help', 'whoami', 'shifts'].includes(cmd)) {
+        const now = Date.now();
+        if (this.lastActionAt) this.maxActionGapMs = Math.max(this.maxActionGapMs, now - this.lastActionAt);
+        this.lastActionAt = now;
+      }
+      if (this.onSave && this.calls % 100 === 0) this.save();
+      // Read new messages right away (inbox costs no sim time). Seed 3: "Skip R-035, 302 checked out"
+      // arrived while we carried the wallet up; handing it over anyway cost -50.
+      if (this.unread && cmd !== 'inbox' && !this._readingInbox && !this.over) {
+        this._readingInbox = true;
+        try { await this.readInbox(); } finally { this._readingInbox = false; }
+      }
+      const cur = this.current;
+      if (cur && cur.cancelRequested && cur.status === 'open' && !this._finishing && !['report', 'status', 'inbox'].includes(cmd)) {
+        throw new Cancelled(cur.id);
+      }
       this.absorb(cmd, args, j);
       // Answer people who stop the robot right where it is (before walking on).
       if (cmd === 'move' && this.pendingPerson && !this._responding && !this.over) {
@@ -583,11 +638,60 @@
     // ---- reporting --------------------------------------------------------
     async finish(req, outcome, note) {
       const before = this.score;
-      const r = await this.call('report', { request: req.id, outcome, note });
-      req.status = r.ok ? outcome : 'report-failed';
-      await this.syncStatus();
+      // A cancellation that arrived while we worked wins over whatever we were about to report.
+      if (req.cancelRequested && outcome !== 'cancelled' && outcome !== 'done') {
+        outcome = 'cancelled';
+        note = `Cancelled by the night manager: ${req.updates[req.updates.length - 1] || ''}`.trim();
+      }
+      this._finishing = true;
+      let r;
+      try {
+        r = await this.call('report', { request: req.id, outcome, note });
+        req.status = r.ok ? outcome : 'report-failed';
+        await this.syncStatus();
+      } finally {
+        this._finishing = false;
+      }
       req.points = this.score - (req.scoreAtStart === undefined ? before : req.scoreAtStart);
       this.log(`REPORT ${req.id} ${outcome} (${note}) -> ${JSON.stringify(r.result)} | score ${this.score} (${req.points >= 0 ? '+' : ''}${req.points})`);
+      this.save();
+    }
+
+    // ---- state on disk, so a crashed run can continue the same shift (no restarts in the final) ----
+    saveState() {
+      return {
+        v: 1, shift: this.shift, savedAt: new Date().toISOString(), clock: this.clock, score: this.score,
+        requests: [...this.requests.values()], roomOf: this.roomOf, dnd: [...this.dnd], sources: this.sources,
+        g: this.g, verified: this.verified, wet: [...this.wet], wetSince: this.wetSince, lookedAt: this.lookedAt,
+        blocked: this.blocked, cartAt: this.cartAt, foundFor: this.foundFor, supplyLooked: this.supplyLooked,
+        slips: this.slips, calls: this.calls,
+      };
+    }
+
+    loadState(s) {
+      if (!s || s.shift !== this.shift) return false;
+      for (const r of s.requests || []) this.requests.set(r.id, r);
+      Object.assign(this.roomOf, s.roomOf || {});
+      this.dnd = new Set(s.dnd || []);
+      this.sources = s.sources || this.sources;
+      this.g = s.g || this.g;
+      this.verified = s.verified || {};
+      this.wet = new Set(s.wet || []);
+      this.wetSince = s.wetSince || {};
+      this.lookedAt = s.lookedAt || {};
+      this.blocked = s.blocked || {};
+      this.cartAt = s.cartAt || null;
+      this.foundFor = s.foundFor || {};
+      this.supplyLooked = s.supplyLooked || {};
+      this.slips = s.slips || 0;
+      this.prepare = false; // keycard/cart/supply rooms were handled before the crash
+      this.log(`RESUMED from saved state (${this.requests.size} requests, saved ${s.savedAt})`);
+      return true;
+    }
+
+    save() {
+      if (!this.onSave) return;
+      try { this.onSave(this.saveState()); } catch (e) { this.log(`save failed: ${e.message}`); }
     }
 
     // ---- helpers ----------------------------------------------------------
@@ -691,8 +795,14 @@
       const t = req.task;
       this.log(`HANDLE ${req.id} [${t.type}] ${req.text}`);
       const fn = this['handle_' + t.type];
-      if (typeof fn === 'function') return fn.call(this, req);
-      return this.handleUnknown(req);
+      try {
+        if (typeof fn === 'function') return await fn.call(this, req);
+        return await this.handleUnknown(req);
+      } catch (e) {
+        if (!(e instanceof Cancelled)) throw e;
+        this.log(`CANCELLED ${req.id} mid-task: ${req.updates[req.updates.length - 1] || ''}`);
+        if (req.status === 'open') return this.finish(req, 'cancelled', `Stopped: ${req.updates[req.updates.length - 1] || 'cancelled by the night manager'}`);
+      }
     }
 
     handle_deliver(req) { return this.handleDeliver(req); }
@@ -1127,22 +1237,34 @@
     // ---- main loop --------------------------------------------------------
     async run() {
       this.log(`START shift ${this.shift}`);
-      try {
-        if (!this.paused) {
-          await this.syncStatus();
-          if (this.prepare) {
-            // Keycard (room checks) + cart (heavy trays, carries everything) before the first request,
-            // and a look into both supply rooms, since their contents change from night to night.
-            await this.getKeycard();
-            await this.getCart();
-            for (const room of ['laundry', 'storage']) {
-              if (this.supplyLooked[room] || this.unread) continue;
-              if (await this.goTo(room)) await this.lookAround();
+      if (!this.paused) {
+        // Setup errors must not stop the shift: retry a few times, then go on without.
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            await this.syncStatus();
+            if (this.prepare) {
+              // Keycard (room checks) + cart (heavy trays, carries everything) before the first request,
+              // and a look into both supply rooms, since their contents change from night to night.
+              await this.getKeycard();
+              await this.getCart();
+              for (const room of ['laundry', 'storage']) {
+                if (this.supplyLooked[room] || this.unread) continue;
+                if (await this.goTo(room)) await this.lookAround();
+              }
             }
+            break;
+          } catch (e) {
+            if (e instanceof ShiftOver || this.over) return this.summary('over');
+            this.errors++;
+            this.log(`ERROR during setup: ${e && e.stack || e}`);
+            await sleep(1000);
           }
         }
-        this.paused = null;
-        while (!this.over) {
+      }
+      this.paused = null;
+      // One try per final shift: an error in one request must never end the night.
+      while (!this.over) {
+        try {
           if (this.hold) throw new Paused('hold'); // set agent.hold = true to pause between tasks
           if (this.unread) await this.readInbox();
           for (const req of this.openRequests()) {
@@ -1157,23 +1279,41 @@
           if (this.battery < this.lowBattery) { await this.charge(); continue; }
           const req = this.nextRequest();
           if (!req) { await this.idle(); continue; }
+          this.current = req;
           await this.handle(req);
-          await this.syncStatus();
+          this.current = null;
+          if (this.trace.length && this.trace[this.trace.length - 1].cmd !== 'status') await this.syncStatus();
+        } catch (e) {
+          if (e instanceof Paused) { this.log(`PAUSED on ${e.message}`); return this.summary('paused'); }
+          if (e instanceof ShiftOver || this.over) break;
+          this.errors++;
+          this.log(`ERROR #${this.errors}: ${e && e.stack || e}`);
+          const cur = this.current;
+          this.current = null;
+          if (cur && cur.status === 'open') {
+            cur.errorCount = (cur.errorCount || 0) + 1;
+            if (cur.errorCount >= 2) {
+              try { await this.finish(cur, 'failed', 'Could not complete this request.'); } catch (e2) { cur.status = 'failed'; }
+            }
+          }
+          try { await this.syncStatus(); } catch (e3) { /* network trouble: next round */ }
+          await sleep(Math.min(5000, 250 * this.errors));
         }
-      } catch (e) {
-        if (e instanceof Paused) { this.log(`PAUSED on ${e.message}`); return this.summary('paused'); }
-        if (!(e instanceof ShiftOver)) { this.log(`ERROR ${e && e.stack || e}`); return this.summary('error'); }
       }
+      this.save();
       return this.summary('over');
     }
 
     summary(state) {
       const reqs = [...this.requests.values()].map((r) => ({ id: r.id, text: r.text, type: r.task.type, status: r.status, points: r.points }));
-      return { state, shift: this.shift, clock: this.clock, score: this.score, battery: this.battery, calls: this.calls, requests: reqs };
+      return {
+        state, shift: this.shift, clock: this.clock, score: this.score, battery: this.battery, calls: this.calls,
+        errors: this.errors, slips: this.slips, maxActionGapMs: this.maxActionGapMs, requests: reqs,
+      };
     }
   }
 
-  const api = { Agent, startShift, apiCall, parseRequest, buildGraph, EDGES, clockToSeconds, Paused, ShiftOver };
+  const api = { Agent, RateLimiter, startShift, apiCall, parseRequest, buildGraph, EDGES, clockToSeconds, Paused, ShiftOver, Cancelled };
   root.NightShift = api;
   if (typeof module === 'object' && module.exports) module.exports = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
