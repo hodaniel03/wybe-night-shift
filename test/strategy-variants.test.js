@@ -244,3 +244,63 @@ test('lost retry expands to unsearched places instead of scanning the same three
  await a.handleLost(r);assert.equal(r.retried,true);assert.equal(r.searchScanned.length,3);assert.equal(outcome,undefined);
  await a.handleLost(r);assert.equal(outcome,'failed');assert.equal(scans.length,6);assert.equal(new Set(scans).size,6);
 });
+
+test('endgame picks a battery-feasible job instead of charging for an expensive search',()=>{
+ const a=configure(agent(),'endgame');a.clock='05:40:00';a.loc='lobby';a.battery=11;
+ const lost=req('R-001','Guest in 101 lost a wallet, maybe the lobby.',27000);
+ const inspect=req('R-002','Check if 201 is empty and tidy, report back.',27001);
+ add(a,lost,inspect);a.lostSightings={wallet:{place:'lobby',atS:27001}};
+ a.batteryOk=r=>r===inspect;
+ assert.equal(a.nextRequest(),inspect);
+ a.batteryOk=()=>false;assert.ok(a.nextRequest(),'without any feasible job, keep the normal charging path');
+});
+
+test('the endgame reserve permits a safe job below the charging trigger but never one below its reserve',async()=>{
+ for(const feasible of [true,false]){
+  const a=configure(agent(),'endgame');a.prepare=false;a.unread=false;a.clock='05:40:00';a.battery=11;
+  const r=req('R-001','Check if 101 is empty and tidy, report back.',27000);add(a,r);
+  a.syncStatus=async()=>({ok:true});a.batteryOk=()=>feasible;
+  let handled=0,charged=0;a.handle=async()=>{handled++;a.over=true;};a.charge=async()=>{charged++;a.over=true;};
+  await a.run();assert.equal(handled,feasible?1:0);assert.equal(charged,feasible?0:1);
+ }
+});
+
+test('manager lookup uses a confirmed room and falls back to the desk when unavailable',async()=>{
+ for(const available of [true,false]){
+  const a=agent();let desk=0,questions=0;a.resolveRoom=async()=>{desk++;return 'room-207';};
+  configure(a,'efficient');a.askAbout=async r=>{questions++;r.asked=true;if(available)r.task.room='room-203';};
+  const r=req('R-001','Mr Berg would like a towel.');
+  assert.equal(await a.resolveRoom(r),available?'room-203':'room-207');assert.equal(desk,available?0:1);
+  if(!available){await a.resolveRoom(req('R-002','Ms Hansen would like a pillow.'));assert.equal(questions,1,'stop asking once unavailable');}
+ }
+});
+
+test('heavy batching collects only pending same-floor orders and journals each correct owner',async()=>{
+ const a=agent();const picks=[];a.pickItem=async function(item){picks.push({item,owner:this.current.id});this.cart.push(item);return true;};configure(a,'efficient');
+ const first=req('R-001','Bring the tray from the kitchen pass to 201.');first.expectedFetch='tray-201';
+ const second=req('R-002','Bring the tray from the kitchen pass to 202.');
+ const upstairs=req('R-003','Bring the tray from the kitchen pass to 301.');
+ add(a,first,second,upstairs);a.current=first;a.loc='kitchen-pass';a.cart=[];a.plan=()=>({cost:1,steps:[]});
+ a.call=async()=>({ok:true,result:{objects:['tray-202','tray-301']}});
+ await a.pickItem('tray-201');
+ assert.deepEqual(picks,[{item:'tray-201',owner:first.id},{item:'tray-202',owner:second.id}]);
+ assert.equal(first.picked,'tray-201');assert.equal(second.picked,'tray-202');assert.equal(upstairs.picked,undefined);assert.equal(a.current,first);
+ const saved=a.saveState();assert.equal(saved.requests.find(r=>r.id===second.id).picked,'tray-202');
+});
+
+test('cancellation of a batched secondary pickup never cancels the primary delivery',async()=>{
+ const a=agent();a.pickItem=async function(item){if(item==='tray-202'){this.current.cancelRequested=true;throw Error('cancelled secondary');}this.cart.push(item);return true;};configure(a,'efficient');
+ const first=req('R-001','Bring the tray from the kitchen pass to 201.');first.expectedFetch='tray-201';
+ const second=req('R-002','Bring the tray from the kitchen pass to 202.');add(a,first,second);
+ a.current=first;a.loc='kitchen-pass';a.cart=[];a.plan=()=>({cost:1});a.call=async()=>({ok:true,result:{objects:['tray-202']}});
+ a.finish=async(r,o)=>{r.status=o;};await a.pickItem('tray-201');
+ assert.equal(second.status,'cancelled');assert.equal(first.status,'open');assert.equal(first.cancelRequested,undefined);assert.equal(a.current,first);
+});
+
+test('spill clarification accepts one compatible exact location and otherwise retains floor search',async()=>{
+ for(const answer of ['The spill is in corridor-2b.','It may be corridor-2a or corridor-2d.','The spill is in corridor-3a.','You have it exactly as written.']){
+  const a=agent();let observed;a.handle_spill=async r=>{observed=r.task.places;};configure(a,'efficient');a.call=async()=>({ok:true,result:answer});
+  const r=req('R-001','Someone mentioned a spill on floor 2.');await a.handle_spill(r);
+  assert.deepEqual(observed,answer==='The spill is in corridor-2b.'?['corridor-2b']:[]);
+ }
+});

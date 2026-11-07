@@ -368,6 +368,7 @@
       this.lookTtl = opts.lookTtl || 300; // seconds of sim time a `look` stays trusted
       this.maxSearchLocations = opts.maxSearchLocations === undefined ? 10 : opts.maxSearchLocations;
       this.expandLostRetry = !!opts.expandLostRetry;
+      this.finishOnRemainingBattery = !!opts.finishOnRemainingBattery;
       this.lookedAt = {};
       this.wet = new Set();
       this.wetSince = {};
@@ -997,7 +998,8 @@
     // ---- state on disk, so a crashed run can continue the same shift (no restarts in the final) ----
     saveState() {
       return {
-        v: 2, shift: this.shift, savedAt: new Date().toISOString(), clock: this.clock, score: this.score,
+        v: 2, shift: this.shift, strategy: this.policyName || this.strategyVariant || 'baseline',
+        savedAt: new Date().toISOString(), clock: this.clock, score: this.score,
         requests: [...this.requests.values()], roomOf: this.roomOf, dnd: [...this.dnd], sources: this.sources,
         g: this.g, verified: this.verified, wet: [...this.wet], wetSince: this.wetSince, lookedAt: this.lookedAt,
         blocked: this.blocked, blockCount: this.blockCount, objectsAt: this.objectsAt, cartAt: this.cartAt, foundFor: this.foundFor, supplyLooked: this.supplyLooked,
@@ -1012,6 +1014,7 @@
     loadState(s) {
       if (!s || s.shift !== this.shift) return false;
       for (const k of ['clock', 'score', 'loc', 'hands', 'cart', 'battery', 'pendingAction', 'maxActionGapMs', 'errors', 'calls']) if (s[k] !== undefined) this[k] = s[k];
+      if (s.strategy) this.policyName = s.strategy;
       this.recoveryWarnings = s.recoveryWarnings || [];
       this.lostSightings = s.lostSightings || {};
       this.looseSupplies = s.looseSupplies || {};
@@ -1978,8 +1981,12 @@
             for (const req of this.openRequests()) await this.finish(req, 'failed', 'The night shift ended before I could finish this.');
           }
           for (const q of this.openRequests()) if (q.needsAnswer && !q.asked) await this.askAbout(q);
-          if (this.battery < this.lowBattery) { await this.charge(); continue; }
           const req = this.nextRequest();
+          // Optional endgame policy still requires the normal conservative task +
+          // return-to-dock reserve; the low-battery trigger alone need not force sleep.
+          const lateFeasible = this.finishOnRemainingBattery && clockToSeconds(this.clock) >= 7 * 3600
+            && req && this.batteryOk(req);
+          if (this.battery < this.lowBattery && !lateFeasible) { await this.charge(); continue; }
           if (!req) { await this.idle(); continue; }
           if (!this.batteryOk(req) && this.battery < 60 && this._chargedFor !== req.id) { this._chargedFor = req.id; await this.charge(); continue; }
           this.current = req;

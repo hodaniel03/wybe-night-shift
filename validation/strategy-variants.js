@@ -10,6 +10,8 @@ const PRESETS = {
   batch: { scheduling: true, prefetch: true, forceBatchCart: true, maxPrefetch: 6 },
   batch3: { scheduling: true, prefetch: true, forceBatchCart: true, maxPrefetch: 6, maxSearchLocations: 3, maxExplorationDefers: 1 },
   stocked: { scheduling: true, prefetch: true, forceBatchCart: true, maxPrefetch: 6, maxSearchLocations: 3, maxExplorationDefers: 1, restock: true },
+  efficient: { scheduling: true, prefetch: true, forceBatchCart: true, maxPrefetch: 6, maxSearchLocations: 3, maxExplorationDefers: 1, restock: true, finishOnRemainingBattery: true, managerLookup: true, heavyBatch: true, clarifySpills: true },
+  endgame: { scheduling: true, prefetch: true, forceBatchCart: true, maxPrefetch: 6, maxSearchLocations: 3, maxExplorationDefers: 1, restock: true, finishOnRemainingBattery: true },
   coverage: { scheduling: true, prefetch: true, forceBatchCart: true, maxPrefetch: 6, maxSearchLocations: 3, maxExplorationDefers: 1, restock: true, expandLostRetry: true },
   cover_spills: { scheduling: true, prefetch: true, forceBatchCart: true, maxPrefetch: 6, maxSearchLocations: 3, maxExplorationDefers: 1, restock: true, coverSpills: true },
   balanced: { scheduling: true, prefetch: true, forceBatchCart: true, maxPrefetch: 6, maxSearchLocations: 4, maxExplorationDefers: 2, lowBattery: 10, chargeTo: 26 },
@@ -328,6 +330,10 @@ function configure(agent, options = {}) {
     const now = seconds(this.clock);
     const open = this.openRequests().filter(r => eligible(this, r, now));
     open.sort((a, b) => estimate(this, b).priority - estimate(this, a).priority || a.atS - b.atS);
+    if (policy.finishOnRemainingBattery && now >= 7*3600) {
+      const feasible = open.find(r => this.batteryOk(r));
+      if (feasible) return feasible;
+    }
     return open[0] || null;
   };
   if (policy.maxExplorationDefers !== undefined) {
@@ -342,6 +348,76 @@ function configure(agent, options = {}) {
   if (policy.restock) configureStocked(agent);
   if (policy.coverSpills) agent.handle_spill = coverSpills;
   if (policy.expandLostRetry) agent.expandLostRetry = true;
+  if (policy.finishOnRemainingBattery) agent.finishOnRemainingBattery = true;
+  if (policy.clarifySpills) {
+    const handleSpill = agent.handle_spill;
+    agent.handle_spill = async function (req) {
+      if (!req.task.places.length && !req.spillClarificationAsked && !this._spillClarificationUnavailable) {
+        req.spillClarificationAsked = true;this.save();
+        const reply = await this.call('reply',{request:req.id,text:'Which corridor or exact location is the spill in?'});
+        const text = JSON.stringify(reply.result || '');
+        const places = [...new Set(text.match(/corridor-[123][a-z]|\blobby\b/g)||[])];
+        const compatible = places.filter(p=>!req.task.floor || (p==='lobby'?1:Number(p[9]))===req.task.floor);
+        if (reply.ok && places.length===1 && compatible.length===1) {req.task.places=compatible;this.save();}
+        else this._spillClarificationUnavailable=true;
+        this.log(`SPILL CLARIFICATION ${req.id}: ${text}`);
+      }
+      return handleSpill.call(this,req);
+    };
+  }
+  if (policy.heavyBatch) {
+    const pickItem = agent.pickItem;
+    agent.pickItem = async function (item) {
+      const req = this.current;
+      const ok = await pickItem.call(this,item);
+      if (!ok || this._heavyBatch || !req || req.task.type !== 'fetch' || !/^(tray|luggage|bag|suitcase)-/.test(item)
+        || this.cart === null || this.loc !== req.task.from || this.cart.length >= 7) return ok;
+      // Make the primary pickup durable before starting another request's pickup.
+      req.picked = item; this.save();
+      const room = roomFor(this,req);
+      const pending = this.openRequests().filter(r=>r!==req && r.task.type==='fetch' && !r.cancelRequested
+        && !r.picked && !(r.notBefore>seconds(this.clock)) && r.task.from===this.loc
+        && roomFor(this,r) && room && roomFor(this,r)[5]===room[5] && !this.dnd.has(roomFor(this,r))
+        && this.plan(this.loc,this.corridorOf(roomFor(this,r)),true)).slice(0,2);
+      if (!pending.length) return ok;
+      this._heavyBatch = true;
+      try {
+        const looked = await this.call('look');
+        const objects = ((looked.result && looked.result.objects)||[]).map(o=>String(o).replace(/\s+x\d+$/,''));
+        for (const other of pending) {
+          if (this.cart.length >= 7 || req.cancelRequested || other.cancelRequested) break;
+          const destination = roomFor(this,other);
+          const prefix = /tray|room service/i.test(other.task.what||'') ? 'tray' : 'luggage';
+          const name = this.selectFetchItem(other,objects,prefix,destination.slice(5));
+          if (!name) continue;
+          other.task.room = destination;other.expectedFetch = name;this.save();
+          const previous = this.current;
+          this.current = other; // journal the pickup against its actual owner
+          try {
+            if (await pickItem.call(this,name)) {other.picked=name;this.save();this.log(`HEAVY BATCH ${req.id}: collected ${name} for ${other.id}`);}
+          } catch(e) {
+            if (!other.cancelRequested) throw e;
+            await this.finish(other,'cancelled','Stopped this pickup after the manager cancelled it.');
+          } finally {this.current=previous;}
+        }
+      } finally {this._heavyBatch=false;}
+      return ok;
+    };
+  }
+  if (policy.managerLookup) {
+    const resolveRoom = agent.resolveRoom;
+    agent.resolveRoom = async function (req) {
+      const t = req.task;
+      if (!t.room && t.name && !this.roomOf[t.name] && !req.asked && !this._managerLookupUnavailable) {
+        // Try the existing clarification command once; physical desk lookup
+        // remains the fallback if the manager cannot resolve a named guest.
+        await this.askAbout(req);
+        if (req.task.room) { this.roomOf[t.name] = req.task.room; return req.task.room; }
+        this._managerLookupUnavailable = true;
+      }
+      return resolveRoom.call(this,req);
+    };
+  }
   if (policy.targetedNoise) agent.handle_noise = targetedNoise;
   if (policy.readStaffNote || policy.readManual) configureScout(agent, { readStaffNote: !!policy.readStaffNote, readManual: !!policy.readManual });
   if (policy.prefetch) {

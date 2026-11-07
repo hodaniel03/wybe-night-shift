@@ -65,3 +65,41 @@ Rettelsen reserverer to tralleplasser i lagerstrategien. Ved eksplisitt «cart i
 De to første målrettede gjentakelsene ga seed 22: 1666 → 1991 og seed 35: 2058 → 2091. Begge hadde null avviste ferdigrapporter og null programfeil. Åtte-scenarioserien er fortsatt i gang; dette er ikke et fullført gjennomsnittsresultat.
 
 Grunnrettelsene testes separat fra to nye forsøksvarianter: `cover_spills` sikrer alle observerte våte flekker på etasjen, og `coverage` søker nye steder i andre hittegodsforsøk. Ingen av disse to variantene er produksjonsstandard. Hele testpakken består nå 91 tester.
+
+## Stresstest og effektivitetsstudie, lørdag kveld
+
+Den ferdige trallerettelsen (`stocked-v11-cart-06`) ga +49 poeng i snitt over åtte identiske scenarioer sammenlignet med forrige lagerstrategi. Snittet ble 2232,5, laveste resultat 1991 og beste 2433. Ingen programfeil, to sklitak og to ubekreftede ferdigrapporter. Sølvarianten ble ikke valgt: −35 poeng i snitt på dens åtte sammenligninger. Utvidet hittegodssøk ga −4 poeng i snitt på åtte scenarioer; rekord 2460 i ett av dem beviser ikke bedre generell kvalitet.
+
+En lokal stresstest kjørte ti parallelle Agent-instanser gjennom 60 leveranser. Den injiserte 10 ratebegrensninger (429), 10 midlertidige serverfeil (503 på status) og 20 svar som gikk tapt etter at leveringen var utført. Alle 60 leveranser skjedde nøyaktig én gang. Totalt 280 simulerte API-kall; største lokale handlingsgap 1143 ms. Testen bruker en lokal fetch-erstatning, ingen finaleskift eller eksterne belastningskall. Den kan ikke garantere oppetid eller latenstid hos den ekte serveren.
+
+Produksjonsprosjektet består 92 tester inkludert stresstesten. Arbeidskopien består 95 tester med ekstra forsøk på sluttbatteri og romavklaring. Disse ekstra strategiene er ikke produksjonsstandard.
+
+Pågående kontrollert serie: `sweep-production-v021-09` spiller dagens installerte agent på seeds 47–54. `efficiency-study.js` venter til denne er ferdig, spiller `stocked` på samme åtte, deretter `efficient` på samme åtte. Sistnevnte prøver batterifeasible oppgaver etter 05:00 og én romavklaring via nattleder før vanlig resepsjonsoppslag. Hvis nattlederen ikke kan svare, slås dette forsøket av for resten av skiftet.
+
+Etter sammenligningen velger skriptet kun en øvingsvariant: høyest målt snitt blant komplette feilfrie serier med minst like bra dårligste resultat og ikke flere ubekreftede ferdigrapporter enn produksjonsreferansen. Den prøves på nye seeds 55–70. Valget lagres i `efficiency-selection.json`. Det endrer ikke finalekonfigurasjonen automatisk. Alle kjøringer er practice, med maksimalt fire samtidige og felles 40 kall/s-begrenser.
+
+
+Referansen på seeds 47–54 er fullført: snitt **1929**, svakeste **1383**, beste **2226**, null programfeil, ett sklitak og tre ubekreftede sølrapporter. Samme-seed-testen av `stocked` har startet.
+
+`efficient` prøver også samlasting av opptil to allerede bestilte brett/bagasjer til samme etasje, med separat oppdragseierskap og journalføring, samt én forespørsel om nøyaktig sølsted til nattlederen. Avklaringsfunksjonene har vanlig oppslag/søk som fallback når nattlederen ikke kan svare. API-støtten for disse avklaringene er foreløpig ikke bekreftet. Sammenligningen måler effekten av den samlede kandidaten, ikke hvert tiltak isolert.
+
+
+## Versjon 0.3.0: standardstrategien er oppdatert
+
+Sammenligningen på seeds 47–54 er ferdig:
+
+| Strategi | Snitt | Svakeste | Beste | Programfeil | Ubekreftede ferdigrapporter |
+|---|---:|---:|---:|---:|---:|
+| Tidligere produksjon | 1929 | 1383 | 2226 | 0 | 3 |
+| Lager og verdi-prioritering | 2097,5 | 1927 | 2290 | 0 | 2 |
+| Efficient, valgt standard | 2110,75 | 1941 | 2373 | 0 | 2 |
+
+Ny standard forbedret snittet **9,4 %** på disse åtte scenarioene. Ytterligere 16 nye seeds (55–70) ga snitt 2084,125, svakeste 1630, beste 2469, null programfeil og én ubekreftet ferdigrapport. De 16 nye scenarioene er ikke en paret sammenligning mot gammel produksjon.
+
+`src/policy.js` er en frosset kopi av den målte strategien, og `run.js` velger `efficient` som standard. `--strategy baseline` finnes for sammenligning. Strategien og lagerbudsjettet lagres; eldre tilstandsfiler uten strategifelt fortsetter som baseline. Installerte versjon 0.3.0 består 101 tester og API-preflight. Ingen finaleskift er startet.
+
+Nattlederen svarte «exactly as written» på ekstra avklaringsforsøk; disse er derfor ikke en dokumentert kilde til forbedringen. Vanlig resepsjonsoppslag og søk brukes som fallback.
+
+Neste kandidat, `adaptive`, er kun under testing: den fortsetter hittegodssøk på nye steder på andre forsøk og slipper fram også ikke-hastende, klare oppdrag ved en søkegrense. Åtte tidligere målte scenarioer brukes: 55, 58, 60, 61, 63, 65, 66, 68. Resultater i `sweep-adaptive-v031-13`.
+
+Målelogger finnes i `/Users/hodanielkhuu/Documents/ChatGPT/Oslo Sprint Hackathon 2/wybe-hardening/validation/`.

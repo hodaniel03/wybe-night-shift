@@ -14,6 +14,7 @@ const USAGE = `Bruk: node run.js [valg]
   --wait-until HH:MM      klokkeslett i Europe/Oslo (final: søndag 8. november)
   --resume FIL|ID,ID      fortsett de samme skiftene; starter aldri nye
   --unknown skip|decline  standard decline
+  --strategy efficient|baseline  standard efficient; gjenopptakelse beholder lagret strategi
   --quiet                 bare fremdrift og resultat i terminalen
   --check                 sjekk oppsett og API; starter ingen skift
   --yes                   bekreft finalestart
@@ -33,8 +34,8 @@ function loadEnv(file) {
 }
 
 function parseArgs(argv) {
-  const a = { mode: 'practice', count: 1, parallel: 0, quiet: false, unknown: 'decline', yes: false };
-  const values = new Map([['--mode','mode'],['--seed','seed'],['--count','count'],['--parallel','parallel'],['--wait-until','waitUntil'],['--resume','resume'],['--unknown','unknown']]);
+  const a = { mode: 'practice', count: 1, parallel: 0, quiet: false, unknown: 'decline', yes: false, strategy: 'efficient', strategyExplicit: false };
+  const values = new Map([['--mode','mode'],['--seed','seed'],['--count','count'],['--parallel','parallel'],['--wait-until','waitUntil'],['--resume','resume'],['--unknown','unknown'],['--strategy','strategy']]);
   const seen = new Set();
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i];
@@ -50,6 +51,8 @@ function parseArgs(argv) {
     else if (k === '--help' || k === '-h') a.help = true;
     else throw new Error(`Ukjent argument: ${k}`);
   }
+  a.strategyExplicit = seen.has('--strategy');
+  if (!['baseline','efficient'].includes(a.strategy)) throw new Error('--strategy må være baseline eller efficient.');
   if (!['practice', 'final'].includes(a.mode)) throw new Error('--mode må være practice eller final.');
   if (!['skip','decline'].includes(a.unknown)) throw new Error('--unknown må være skip eller decline.');
   for (const k of ['count','parallel']) {
@@ -96,7 +99,9 @@ function readManifest(file) {
   const infos = Array.isArray(obj) ? obj : obj.shifts;
   if (Array.isArray(infos) && infos.length) validateInfos(infos);
   else if (!obj || obj.version !== 2 || !Array.isArray(infos)) throw new Error('Ugyldig skiftliste.');
-  return { version: 2, mode: obj.mode || (infos[0] && infos[0].mode), expected: obj.expected || infos.length, shifts: infos, pendingStart: obj.pendingStart || null };
+  const strategy = obj.strategy || (infos.length ? 'baseline' : undefined);
+  if (strategy && !['baseline','efficient'].includes(strategy)) throw new Error('Ugyldig lagret strategi.');
+  return { version: 2, mode: obj.mode || (infos[0] && infos[0].mode), expected: obj.expected || infos.length, shifts: infos, strategy, pendingStart: obj.pendingStart || null };
 }
 
 // Exclusive lock per shift; stale locks from a killed process are removed automatically.
@@ -230,7 +235,12 @@ async function runOne({ key, base, info, args, logsDir, stamp, limiter, quiet })
     onSave: s => writeAtomic(statePath,s) });
   const t0 = Date.now();
   try {
-    if (fs.existsSync(statePath)) agent.loadState(JSON.parse(fs.readFileSync(statePath,'utf8')));
+    const saved = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath,'utf8')) : null;
+    const strategy = saved ? (saved.strategy || 'baseline') : args.strategy;
+    if (saved && args.strategyExplicit && args.strategy !== strategy) throw new Error(`Skiftet bruker lagret strategi ${strategy}; gjenoppta uten --strategy.`);
+    require('./src/policy').applyPolicy(agent,strategy);
+    if (saved) agent.loadState(saved);
+    agent.log(`STRATEGY ${strategy}`);
     let summary;
     try { summary = info.status === 'ended' && Number.isFinite(info.score) ? {...agent.summary('over'), score:info.score} : await agent.run(); }
     catch (e) { agent.log(`CRASH ${e && e.stack || e}`); agent.save(); summary = Object.assign(agent.summary('crash'),{error:String(e)}); }
@@ -304,8 +314,12 @@ async function main(argv = process.argv.slice(2)) {
     manifest.expected = args.mode === 'final' ? 10 : manifest.shifts.length;
   } else {
     listFile = path.join(logsDir,args.mode === 'final' ? 'final-shifts.json' : `${stamp}-practice-shifts.json`);
-    manifest = args.mode === 'final' && fs.existsSync(listFile) ? readManifest(listFile) : {version:2,mode:args.mode,expected:args.parallel || args.count,shifts:[],pendingStart:null};
+    manifest = args.mode === 'final' && fs.existsSync(listFile) ? readManifest(listFile) : {version:2,mode:args.mode,expected:args.parallel || args.count,shifts:[],strategy:args.strategy,pendingStart:null};
     if (args.mode === 'final') manifest.expected = 10;
+  }
+  if (manifest.strategy) {
+    if (args.strategyExplicit && args.strategy !== manifest.strategy) throw new Error('Gjenopptakelse må bruke den lagrede strategien; utelat --strategy.');
+    args.strategy = manifest.strategy;
   }
   const releaseFinal = args.mode === 'final' ? acquireLock(path.join(logsDir,'final-run.lock')) : () => {};
   try {

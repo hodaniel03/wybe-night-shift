@@ -80,3 +80,10 @@ Kjør `npm test` for regresjonstestene. Se [NOTES.md](NOTES.md) for tidligere ob
 ## Hvorfor antall skift kan øke uten flere poeng
 
 Øvingslisten viser **beste enkeltskift**, ikke totalpoeng. Ti nye skift på 2000 poeng endrer ikke en eksisterende rekord på 2338. Agenten lærer kart og lager innenfor hver natt, men strategien forbedres først når koden eller policyen endres og forbedringen blir målt. Se `validation/RESULTS.md` for faktiske resultater.
+
+
+## Strategi i versjon 0.3.0
+
+Nye kjøringer bruker den målte `efficient`-strategien: prioritering etter forventet poeng per tidsbruk, lagerreserve med ledig tralleplass, samlasting av ventende henteoppdrag og batterifeasible oppgaver sent på natten. På åtte identiske scenarioer økte snittet fra 1929 til 2110,75 (+9,4 %). Ytterligere 16 scenarioer ble fullført uten programfeil. Se valideringsrapporten for begrensningene.
+
+Vanlige startkommandoer er uendret. `--strategy baseline` velger den tidligere strategien for sammenligning. Gjenopptakelse bruker lagret strategi; eldre skift uten strategifelt fortsetter med baseline. Finalestart venter fortsatt til søndag kl. 12:00 i Oslo.

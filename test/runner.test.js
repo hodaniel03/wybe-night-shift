@@ -69,6 +69,7 @@ test('runner starts ten finals concurrently, recovers an ambiguous start and res
   try {
     fs.mkdirSync(path.join(dir,'src'));
     fs.copyFileSync(path.join(__dirname,'../run.js'),path.join(dir,'run.js'));
+    fs.copyFileSync(path.join(__dirname,'../src/policy.js'),path.join(dir,'src/policy.js'));
     fs.writeFileSync(path.join(dir,'src/agent.js'),`
       const fs=require('fs');
       const state={starts:0,active:0,maxActive:0,shifts:[],seeds:[],reads:[]};
