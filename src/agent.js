@@ -1067,8 +1067,29 @@
       if (!newest || (newest.signed && missed.length)) {
         return this.finish(req, 'failed', `Looked at ${places.filter((p) => !missed.includes(p)).join(', ')}; no new spill${missed.length ? ` (could not get to ${missed.join(', ')})` : ''}.`);
       }
+      if (newest.signed && this.signedSpillOutcome === 'restack') {
+        // Experiment: the new spill may lie where an older one already has a sign. Put a second sign there.
+        if (this.carrying('wet-floor-sign') || (await this.collect(['wet-floor-sign'])) || (await this.reclaimSign(newest.place))) {
+          if (await this.goTo(newest.place)) {
+            const r2 = await this.call('place', { item: 'wet-floor-sign', where: newest.place });
+            this.log(`RESTACK at ${newest.place}: ${JSON.stringify(r2.result)}`);
+            if (r2.ok) {
+              if (this.cart) { const k = this.cart.indexOf('wet-floor-sign'); if (k >= 0) this.cart.splice(k, 1); }
+              const h2 = this.hands.indexOf('wet-floor-sign'); if (h2 >= 0) this.hands.splice(h2, 1);
+              this.signsPlaced.push({ place: newest.place, atS: clockToSeconds(this.clock) });
+              return this.finish(req, 'done', `Put a wet floor sign over the new spill in ${newest.place}.`);
+            }
+          }
+        }
+      }
+      // Several old unsigned patches and nothing new in sight: we cannot tell which one the message means
+      // (seed 11: guessed the newest-looking one, -30). A wrong sign costs more than no sign.
+      const unsignedOld = seen.filter((x) => !x.signed && x.since < req.atS - 600);
+      if (!newest.signed && newest.since < req.atS - 600 && (unsignedOld.length > 1 || missed.length)) {
+        return this.finish(req, 'failed', `Several old wet patches on floor ${t.floor || '?'} (${unsignedOld.map((x) => x.place).join(', ')}) and no new one; could not tell which one was meant.`);
+      }
       if (newest.signed) {
-        return this.finish(req, this.signedSpillOutcome, `Checked floor ${t.floor || '?'}: the newest wet patch (${newest.place}) already has a wet floor sign, and the other patches are older. Nothing new to sign.`);
+        return this.finish(req, this.signedSpillOutcome === 'restack' ? 'declined' : this.signedSpillOutcome, `Checked floor ${t.floor || '?'}: the newest wet patch (${newest.place}) already has a wet floor sign, and the other patches are older. Nothing new to sign.`);
       }
       const spot = newest.place;
       if (!this.carrying('wet-floor-sign') && !(await this.collect(['wet-floor-sign']))) {
