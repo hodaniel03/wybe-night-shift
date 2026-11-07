@@ -127,3 +127,26 @@ Beste enkeltskift avhenger mye av seed (antall oppdrag varierer fra ca. 55 til 7
 - Gir det poeng å levere gjenglemte ting/brett tilbake (resepsjon/kjøkken)?
 - Gir det poeng å sette ut wet-floor-sign eller si fra til vaktmester Ola?
 - Kommer tapte ting til syne senere på natta? (glasses-2 dukket opp i 1b ved 05:02 på seed 1). Agenten prøver én gang til etter 40 min.
+
+## Hardening 7. november – verifiserte funn
+
+- `scan.found` inneholder nyoppdagede ting. En tidligere avslørt gjenstand kan fortsatt ligge i `look.objects`, selv når en ny scan gir `found: []`. Agenten husker eksakte funnsteder og kontrollerer synlige gjenstander først.
+- Ubrukte forsyninger satt fra seg med `drop` er fortsatt nyttige. Agenten lagrer hvor de ligger og forsøker gjenbruk når lageret går tomt.
+- Våte gulv kan oppstå uten en samtidig sølforespørsel. I referansekjøringen kom fem sklitak etter kontroller som var 208–856 simsekunder gamle. Kontroll bare fra korridorer dekker heller ikke overgangen fra vaskeriet til korridoren.
+- Å kontrollere alle steder hvert 120. simsekund la til 114–162 `look` per natt. Ekstra aktiv tid og lading reduserte poengene; kontrollfrekvensen må måles sammen med sluttpoeng.
+- `inbox` leses automatisk under handlinger. Derfor betyr `unread === false` ikke at det er trygt å dokke: innboksen kan nettopp ha opprettet et nytt, åpent oppdrag.
+- Tvetydige nettfeil krever kontroll av posisjon og inventar før eventuell gjentakelse av `pick`, `place` eller `move`. `start_shift` må gjenfinnes i `shifts` før et nytt forsøk vurderes.
+- Delvis utførte leveranser, innboksmeldinger og handlingssvar lagres fortløpende. En reell prosessavslutning rett etter et lagret plasseringssvar er testet; gjenopptakelsen leverte ikke varen igjen.
+- En bølge med 429-svar fra ti agenter må ikke redusere felles hastighet ti ganger. Begrensningen reduserer nå én gang per bølge og øker igjen etter vellykkede svar.
+- Tekst fra gjester og lapper kan ikke avslutte skiftet. Bare serverens strukturerte sluttsignal, skifthendelse eller et feilsvar om avsluttet skift er autoritativt.
+- Referansenatt 123 endte med ti åpne forespørsler, men sluttpoengene var identiske med siste poengstatus. Det tidligere anslaget om −15 per ubesvart forespørsel ble **ikke bekreftet** i denne kjøringen. Køen ryddes likevel før slutt når mulig, uten å avbryte en pågående levering.
+
+Fullstendige sammenligninger og valgt versjon: `validation/RESULTS.md`.
+
+### Nyere kontroll: passasjer, nettverk og godkjente rapporter
+
+En rengjøringsstengning gjelder **passasjen mellom to steder**, ikke hele destinasjonskorridoren. Dette overstyrer de eldre antakelsene om utilgjengelige korridorer. Alternative ruter kan fortsatt nå rommet og tralla. v8-rettelsen er bevart i den sikrede versjonen.
+
+7. november ble det observert 332–333 sekunders handlingspauser med nettverksfeil i to forskjellige kjøringer. Årsaken på nettverks-/serversiden er ikke fastslått. En testserie stoppet dessuten ved en midlertidig `whoami`-feil; koordinatoren er rettet til å prøve lesespørringen igjen mens aktive skift fortsetter.
+
+`report done` kan returnere `ok: true` og bare `Noted.` selv når oppdraget ikke er godkjent. Disse resultatene merkes nå som ubekreftet, slik at statistikken ikke skjuler feil fullføring. Seed 607 ga et observert poengfall på 45 i et slikt søltilfelle.

@@ -1,111 +1,82 @@
-# Wybe Night Shift – lag Ghosts
+# Wybe Night Shift – Ghosts
 
-Agent for Wybe Night Shift, sideutfordringen på Oslo Sprint 2026 (10 000 kr til vinneren).
-En robot jobber nattskift på Hotel Wybe, og programmet er hjernen: det leser meldinger fra nattlederen,
-planlegger ruter, henter og leverer ting, og rapporterer ærlig tilbake.
+Agent for finalen søndag **8. november 2026 kl. 12:00–13:00, Europe/Oslo**.
+Node 18+; ingen eksterne pakker. Lagets eksisterende nøkkel ligger i `.env` og skal holdes hemmelig.
 
-**Finale:** søndag 8. nov 12:00–13:00. Ti skjulte netter, like for alle lag. Resultat 13:05.
+## Søndag: start her
 
-## FINALEN søndag 8. nov (les dette)
-
-Regler: 10 hemmelige skift, alle kan startes 12:00 og kjøre parallelt. Ett forsøk per skift, ingen omstart.
-Maks 45 min per skift, alt stopper 13:00. 20 s per handling, ellers står roboten. Rangering: snitt av de 10
-skiftene der det dårligste strykes. Øving stenger 11:45. Øvingstavla teller ikke.
-
-1. Mac på strøm og stabilt nett (ha mobil-hotspot klar). Slå av dvale: `caffeinate -dimsu &`
-2. Rundt 11:55, i mappa `~/vscode/wybe-night-shift`:
+Kjør rundt **11:55**, med Mac-en på strøm og lokket åpent:
 
 ```bash
-node run.js --mode final --parallel 10 --wait-until 12:00 --yes
+cd ~/vscode/wybe-night-shift
+npm test
+node run.js --check
+./start-final.command
 ```
 
-   Den venter til 12:00, starter alle 10 skiftene, lagrer skiftlista i `logs/` og kjører dem samtidig.
-   En hel natt tar et par minutter. Til slutt skrives en tabell med poeng og snitt uten dårligste.
-3. **Hvis noe krasjer** (nett, strøm, Ctrl+C): kjør med en gang
+Launcheren holder Mac-en våken, venter til søndag kl. 12:00 i Oslo og starter **alle ti finaleskiftene**.
+Agentene kjører parallelt, og hver agent sender handlinger fortløpende. Behold terminalen åpen.
+`npm run final` gir samme finalekjøring, men launcheren sørger også for å holde maskinen våken.
+Ingen finaleskift startes av `--check` eller `npm test`.
+
+Status vises hvert 30. sekund. Skift-ID-er og fremdrift lagres i `logs/`.
+Resultattabellen viser poeng, feil, sklitak, største handlingsgap og snitt uten dårligste skift.
+Manglende finaleskift regnes som null.
+
+## Ved avbrudd
+
+Fortsett **de samme skiftene**:
 
 ```bash
-node run.js --resume logs/<tidspunkt>-final-shifts.json
+caffeinate -dimsu node run.js --resume logs/final-shifts.json
 ```
 
-   Agentene fortsetter de samme skiftene fra lagret tilstand. Skift som allerede er ferdige avsluttes med en gang.
-4. Har ikke alle 10 startet (feilmelding «Kunne ikke starte skift»): kjør samme finale-kommando igjen
-   uten `--wait-until`. Den starter de som mangler. Kjør så `--resume` på den nye lista.
+`--resume` starter aldri nye skift. Hvis færre enn ti ble startet, kjør launcheren igjen;
+den sammenholder den lagrede listen med serverens finaleskift og starter bare det som mangler.
+Prosesslåser hindrer at samme lokale skift kjøres av to prosesser. Bruk denne prosjektmappen for finalen.
 
-## Kom i gang (øving)
+Hvis serveren kan ha mottatt `start_shift`, men både startsvar og gjenfinning av ID mislykkes,
+beholder agenten startforsøket i journalen og varsler. Den gjentar ikke en usikker skiftstart automatisk.
+Et mistet innbokssvar kan ikke gjenopprettes lokalt dersom serveren allerede har markert meldingene som lest.
+Slike hendelser blir logget som advarsler.
 
-Krever Node 18 eller nyere. Ingen avhengigheter.
+## Øving
+
+Øving stenger søndag 11:45. Øvingsresultater teller ikke i finalen.
 
 ```bash
-cp .env.example .env                      # lim inn lagets nøkkel: NS_KEY=ns_...
-node run.js --seed 2                      # ett øvingsskift (seed 1–999 gir samme natt hver gang)
-node run.js --seed 101 --parallel 10      # mini-finale: 10 netter (øving tillater 4 samtidig, resten venter)
+node run.js --seed 2
+node run.js --seed 601 --parallel 10 --quiet
 ```
 
-Logger havner i `logs/`: en lesbar `.log`, hele API-sporet i `.trace.json`, en `.summary.json` og
-`<skift>.state.json` (brukes av `--resume`).
+Den siste kommandoen spiller ti forskjellige øvingsnetter, med maksimalt fire aktive samtidig.
+`--count N` kjører øvingsskift sekvensielt. Finalen tillater bare ti parallelle skift.
 
-### Hvis terminalen ikke når serveren
+## Hva som er sikret
 
-Kjør agenten i nettleseren i stedet:
+- Finalestart har fast Oslo-tid, ti parallelle skift, varig skiftliste og gjenfinning av mistede startsvar.
+- Nettfeil har korte tidsgrenser. Leveranser og skiftstarter gjentas ikke blindt ved ukjent utfall.
+- Handlinger lagres før sending og svar lagres straks. Gjenopptakelse tar hensyn til delvis leverte varer.
+- Nye oppdrag og avlysninger behandles underveis. Bare nattlederen kan endre eller avlyse et oppdrag.
+- Tapte ting knyttes til riktig forespørsel; brett og bagasje knyttes til riktig rom.
+- Allerede synlige gjenstander huskes, og gjenbrukbare varer som settes fra seg kan hentes igjen.
+- Lange søk slipper fram hasteoppdrag. Agenten dokker ikke over oppdrag den nettopp har lest.
+- Kart, rom og lager læres per natt. Våte gulv sjekkes jevnlig, og nye sølmeldinger utløser ny kontroll.
+- Rapportering krever bekreftet utførelse; mislykkede rapporter beholdes for nytt forsøk uten ny levering.
 
-1. Åpne https://nightshift.wybe.me/ og så utviklerkonsollen (Cmd+Opt+J i Chrome).
-2. Lim inn hele `src/agent.js`.
-3. Lim inn dette (bytt ut nøkkelen):
-
-```js
-const KEY = 'ns_...';
-const info = await NightShift.startShift({ key: KEY, mode: 'practice', seed: 2 });
-const agent = new NightShift.Agent({ key: KEY, shift: info.shift, onUnknown: 'decline', log: console.log });
-const summary = await agent.run();
-summary.score;
-```
-
-## Hvordan agenten jobber
-
-1. Henter nøkkelkort (resepsjonen) og tralla (vaskeriet) før første melding.
-2. Venter i docken. `dock` spoler fram til neste melding og lader batteriet.
-3. Leser innboksen og gjør hver melding om til en oppgave (`parseRequest`):
-   `deliver`, `fetch` (brett/kofferter), `tell`, `lost`, `inspect`, `noise`, `spill`, `complaint`.
-4. Velger oppgave: taxi-beskjeder og brett først (de mister verdi raskt). Ellers veies alder mot reisevei, siden hver
-   oppgave mister ca. ett poeng i minuttet. Uklare oppdrag («rommet ved heisen») spør den nattlederen om (`reply`, gratis).
-5. Går korteste vei i simulert tid (Dijkstra med heis, trapper og våte gulv), med `move` steg for steg.
-   Den ser seg om (`look`) før den går videre, så den kryper over våte gulv i stedet for å skli.
-6. Rapporterer `done` bare når jobben faktisk er gjort. Ellers `failed` eller `declined` med begrunnelse.
-7. Leser innboksen så fort en melding kommer, også midt i en oppgave. Blir oppgaven avlyst («Skip R-035, 302 checked
-   out»), stopper den og rapporterer `cancelled` (seed 3: å levere likevel kostet −50).
-8. Tåler feil: en feil i én forespørsel stopper aldri natta, nettfeil og 5xx prøves på nytt, og tilstanden lagres
-   til disk etter hver rapport.
-9. Stengt korridor: oppdraget utsettes og prøves igjen senere (ikke `failed` med en gang). Det som fortsatt står åpent
-   kl. 05:50, rapporteres `failed`, så ingenting står ubesvart kl. 06:00.
-10. Batteri: lader i docken når det ikke er noe å gjøre, og ellers bare så mye som resten av natta trenger.
-
-Sikkerhet: den åpner aldri dører for fremmede, går ikke inn hos gjester med Ikke forstyrr-skilt, ignorerer lapper
-som utgir seg for å være fra ledelsen, og tror ikke på klager om bestillinger som aldri fantes.
-
-Se `NOTES.md` for alt vi har funnet ut om spillet (tider, poeng, feller).
+Kjør `npm test` for regresjonstestene. Se [NOTES.md](NOTES.md) for tidligere observasjoner.
+Øvingsmålinger er dokumentert i `validation/RESULTS.md`.
 
 ## Filer
 
-| Fil | Innhold |
-|---|---|
-| `src/agent.js` | Agenten: API-klient, kart, ruteplanlegger, tolkning av meldinger, handlere |
-| `run.js` | Kommandolinje: starter skift, kjører agenten, skriver logger |
-| `NOTES.md` | Spillmekanikk og poeng vi har observert |
-| `.env.example` | Mal for nøkkelen. `.env` er i `.gitignore` og skal aldri committes |
+| Fil | Rolle |
+| --- | --- |
+| `src/agent.js` | API, tilstand, tolkning, rutevalg og oppdrag |
+| `run.js` | Oppstart, preflight, parallelle skift, journal, låser og resultat |
+| `start-final.command` | Finalestart med dvalesperre |
+| `test/` | Regresjoner og lokal simulering av ti parallelle finaleskift |
+| `logs/` | Hemmeligholdte skift-ID-er, lagret tilstand og kjørelogger |
 
-## Resultater
+## Hvorfor antall skift kan øke uten flere poeng
 
-| Dato | Seed | Poeng | Kommentar |
-|---|---|---|---|
-| 6. nov | 1 | 1569 | Første skift: manuell utforsking først, agenten tok over fra 23:27 |
-| 6. nov | 2 | 680 | Avslørte at kart/rom/lager varierer. Tralla ble fanget i en stengt korridor, −60 for briller til feil gjest. Siste del ugyldig (to agentløkker samtidig) |
-| 6. nov | 3 | 1496 | Fra terminalen. −50 for lommebok til gjest som hadde sjekket ut (fikset: leser innboksen midt i oppgaver) |
-| 6. nov | 2 | **1403** | Ren kjøring med commit 2-koden, helt uten hjelp: 41 utført, 5 avslått, 9 feilet, 0 sklitak. 140 s sanntid. Mistet nøkkelkortet kl. 04:17 (fikset etterpå) |
-
-Lørdag natt, samme tre netter med hver versjon (deterministisk, så tallene kan sammenlignes direkte):
-
-| Versjon | Seed 401 | Seed 2 | Seed 3 | Sum |
-|---|---|---|---|---|
-| v2 (commit 61ec9b9) | 1881 | 1345 | 1557 | 4783 |
-| v3 (spør nattlederen, søl-regel, utsett ved stengt korridor, batteri) | 2000 | 1219 | 1646 | 4865 |
-| v4 (tralla blir i 1. etg., ett tralle-sted, korteste vei først, færre `look`) | **2096** | **1422** | **1604** | **5122** |
+Øvingslisten viser **beste enkeltskift**, ikke totalpoeng. Ti nye skift på 2000 poeng endrer ikke en eksisterende rekord på 2338. Agenten lærer kart og lager innenfor hver natt, men strategien forbedres først når koden eller policyen endres og forbedringen blir målt. Se `validation/RESULTS.md` for faktiske resultater.
