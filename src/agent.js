@@ -116,6 +116,9 @@
   }
 
   const isRoom = (n) => /^room-\d{3}$/.test(n);
+  // A cleaning crew closes a passage between two places, not a whole corridor: seed 401 had 3a<->3b closed for hours
+  // while 3b itself stayed reachable through 3d and 3c.
+  const edgeKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
 
   function clockToSeconds(clock) {
     if (!clock) return null;
@@ -333,12 +336,13 @@
       this.slips = 0;
       this.pendingPerson = null;
       this.supplyLooked = {};
-      this.blocked = {}; // place -> sim second until which we avoid it
+      this.blocked = {}; // "a|b" passage -> sim second until which we avoid it
       this.blockTtl = opts.blockTtl || 1200; // closed corridors usually stay closed for an hour or more
       this.verified = {}; // corridors whose doors we have seen tonight
       this.foundFor = {}; // lost item name -> request id it was found for
       this.signsPlaced = []; // {place, atS} of wet floor signs we put out
       this.placeState = {}; // place -> {wet, signed, atS} from the last look
+      this.objectsAt = {}; // place -> objects in plain sight at the last look
       this.blockCount = {}; // place -> how many times a move there failed because it was closed off
       this.hitBlock = false; // a move failed tonight because a cleaning crew closed a corridor (reset per task)
       this.cartStuck = null; // {at, atS}: we left the cart where only stairs lead on
@@ -423,12 +427,13 @@
       // "Closed off: a cleaning crew has blocked that corridor." -> route around it for a while.
       if (cmd === 'move' && !j.ok && args && args.to && /closed off|blocked|cleaning crew|cordoned/i.test(String(j.result))) {
         // Still closed when we come back: it will probably stay closed even longer.
-        const n = (this.blockCount[args.to] = (this.blockCount[args.to] || 0) + 1);
-        this.blocked[args.to] = clockToSeconds(this.clock) + this.blockTtl * Math.min(3, n);
-        this.log(`BLOCKED ${args.to}: ${j.result}`);
+        const k = edgeKey(this.loc, args.to);
+        const n = (this.blockCount[k] = (this.blockCount[k] || 0) + 1);
+        this.blocked[k] = clockToSeconds(this.clock) + this.blockTtl * Math.min(3, n);
+        this.log(`BLOCKED ${this.loc} -> ${args.to}: ${j.result}`);
       }
       if (cmd === 'move' && j.ok && args && args.to) {
-        delete this.blocked[args.to];
+        delete this.blocked[edgeKey(this.loc, args.to)];
         const at = j.result && (j.result.at || (j.result.outcome && j.result.outcome.at));
         this.loc = at || args.to; // keep the position right even if the task is interrupted after this move
       }
@@ -469,7 +474,7 @@
     // ---- navigation -------------------------------------------------------
     plan(from, to, withCart) {
       const now = clockToSeconds(this.clock);
-      const isBlocked = (v) => this.blocked && this.blocked[v] !== undefined && this.blocked[v] > now;
+      const isBlocked = (u, v) => { const t = this.blocked[edgeKey(u, v)]; return t !== undefined && t > now; };
       const dist = { [from]: 0 }, prev = {}, done = new Set();
       const pq = [[0, from]];
       while (pq.length) {
@@ -481,7 +486,7 @@
         const nbrs = [];
         for (const [v, m] of Object.entries(this.g[u] || {})) {
           if (isRoom(v)) continue;
-          if (isBlocked(v)) continue;
+          if (isBlocked(u, v)) continue;
           const stairs = STAIRS.has(u) && STAIRS.has(v);
           if (stairs && withCart) continue;
           let c = m * (stairs ? SECONDS.stairs : SECONDS.flat);
@@ -552,8 +557,9 @@
       for (const e of res.exits || []) {
         if (e.warning && /wet/i.test(e.warning)) this.markWet(e.to);
         // "blocked": "closed off for cleaning" shows up in look: route around it without trying.
-        if (e.blocked) this.blocked[e.to] = Math.max(this.blocked[e.to] || 0, nowS + this.blockTtl);
-        else if (this.blocked[e.to] !== undefined && !isRoom(e.to)) { delete this.blocked[e.to]; delete this.blockCount[e.to]; }
+        const k = edgeKey(res.location, e.to);
+        if (e.blocked) this.blocked[k] = Math.max(this.blocked[k] || 0, nowS + this.blockTtl);
+        else if (this.blocked[k] !== undefined) { delete this.blocked[k]; delete this.blockCount[k]; }
         // Distances and room numbers differ from night to night: learn the real ones.
         if (typeof e.metres === 'number') {
           (this.g[res.location] = this.g[res.location] || {})[e.to] = e.metres;
@@ -568,6 +574,7 @@
         this.verified[res.location] = true;
       }
       this.learnObjects(res);
+      if (Array.isArray(res.objects)) this.objectsAt[res.location] = res.objects.map((o) => String(o).replace(/\s+x\d+$/, ''));
       return res;
     }
 
@@ -652,7 +659,7 @@
           if (!r.ok) {
             this.log(`move to ${s.to} failed: ${JSON.stringify(r.result)}`);
             await this.syncStatus();
-            if (this.blocked[s.to] !== undefined) {
+            if (this.blocked[edgeKey(this.loc, s.to)] !== undefined) {
               this.hitBlock = true;
               if (depth < 3) return this.goTo(target, depth + 1); // maybe there is another way round
             }
@@ -942,7 +949,7 @@
       // A cart left behind a closed corridor stays useless until the corridor opens again
       // (seed 2: left in corridor-3b, which then stayed closed for the rest of the night).
       const nowS = clockToSeconds(this.clock);
-      if (this.cartAt && (this.blocked[this.cartAt] > nowS || !this.plan(this.cartAt, 'lobby', true))) { this.hitBlock = true; return false; }
+      if (this.cartAt && nowS !== null && !this.plan(this.cartAt, 'lobby', true)) { this.hitBlock = true; return false; }
       // There is only one cart: once we know where it is, look nowhere else.
       const places = this.cartAt ? [this.cartAt] : ['laundry', 'storage'];
       for (const where of places) {
@@ -1383,20 +1390,28 @@
       // their neighbours, scan the usual spots on the ground floor.
       const usual = ['lobby', 'lobby-bar', 'front-desk', 'kitchen-pass', 'corridor-1a', 'corridor-1b', 'corridor-1c', 'laundry'];
       const third = usual.filter((p) => !places.includes(p) && !extra.slice(0, 3).includes(p));
-      for (const ring of [places, extra.slice(0, 3), third]) {
+      const pickHit = (list) => list.find((f) => String(f).toLowerCase() === expected && usable(f)) || list.find(usable);
+      // Seed 2: the wallet lay in plain sight at the kitchen pass ("look" listed it) while "scan" said
+      // "Nothing hidden here": scan only finds hidden things. So check what we have already seen lying around first.
+      // Things in plain sight must be named like the lost item ("wallet", "wallet-2"), not "keycard" for a lost key.
+      const named = (list) => list.filter((f) => { const x = String(f).toLowerCase(); return x === key || x === t.item || x.startsWith(key + '-'); });
+      const seenAt = Object.keys(this.objectsAt).filter((p) => pickHit(named(this.objectsAt[p])));
+      for (const ring of [seenAt, places, extra.slice(0, 3), third]) {
         const todo = ring.filter((p) => !scanned.includes(p));
         while (!foundName && todo.length && scanned.length < 10) {
           todo.sort((a, b) => this.cost(this.loc, a) - this.cost(this.loc, b));
           const p = todo.shift();
           if (!(await this.goTo(p))) continue;
-          const r = await this.call('scan');
+          // In plain sight (look, 5 s) or hidden under sofas and behind counters (scan, 60 s).
+          const res = await this.lookAround();
+          let hit = pickHit(named((res.objects || []).map((o) => String(o).replace(/\s+x\d+$/, ''))));
+          if (!hit) {
+            const r = await this.call('scan');
+            hit = pickHit((r.result && r.result.found) || []);
+          }
           scanned.push(p);
-          const found = (r.result && r.result.found) || [];
-          const hit = found.find((f) => String(f).toLowerCase() === expected && usable(f)) || found.find(usable);
           if (hit) {
-            // Look while it is still in sight: the description may say whose it is.
-            const seen = await this.call('look', { at: hit });
-            this.log(`found ${hit} at ${p}: ${JSON.stringify(seen.result)}`);
+            this.log(`found ${hit} at ${p}`);
             if (this.freeHands() <= 0) await this.dropExtras([]);
             if (await this.pickItem(hit)) { foundName = hit; req.found = hit; this.foundFor[hit] = req.id; }
           }
@@ -1506,7 +1521,7 @@
       const now = clockToSeconds(this.clock);
       const open = this.openRequests().filter((r) => !r.cancelRequested && !(r.notBefore > now)
         && !(r.needsAnswer && r.asked && !r.answered && now - r.askedAtS < 180) // the manager's answer is on its way
-        && !(r.task.room && this.blocked[this.target(r)] > now)); // its corridor is closed off right now
+        && !(r.task.room && !this.plan(this.loc, this.target(r), false))); // no way there right now (closed passages)
       if (!open.length) return null;
       // Every request loses about a point per minute, so a short trip first usually wins; age keeps
       // far-away requests from waiting forever. Requests we could not reach before go last.
@@ -1564,7 +1579,7 @@
           if (clockToSeconds(this.clock) > 7 * 3600 + 50 * 60) {
             const nowS = clockToSeconds(this.clock);
             for (const req of this.openRequests()) {
-              const closedOff = req.task.room && this.blocked[this.target(req)] > nowS;
+              const closedOff = req.task.room && !this.plan(this.loc, this.target(req), false);
               if (req.notBefore || closedOff) await this.finish(req, 'failed', req.retryNote || (closedOff ? `A cleaning crew kept the corridor to ${req.task.room} closed.` : 'Tried twice tonight; could not complete it.'));
             }
           }
