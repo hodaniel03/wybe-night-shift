@@ -643,7 +643,10 @@
         if (s.type === 'move' && this.watchFloors && /^corridor-|^lobby$|^elevator-|^stairwell-/.test(this.loc)) { // the look warns about a wet floor next door
           const seen = this.lookedAt[this.loc];
           const now = clockToSeconds(this.clock);
-          if (seen === undefined || now - seen > this.lookTtl) await this.lookAround();
+          // New spills appear all night: before stepping into a corridor, look again if the last look is a few
+          // minutes old (a slip costs ~15 points and a minute; a look costs 5 s).
+          const ttl = /^corridor-|^lobby$/.test(s.to) && !this.wet.has(s.to) ? 300 : this.lookTtl;
+          if (seen === undefined || now - seen > ttl) await this.lookAround();
         }
         if (s.type === 'elevator') {
           let r = await this.call('call_elevator', { floor: s.floor });
