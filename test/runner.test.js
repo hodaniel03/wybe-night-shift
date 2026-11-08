@@ -70,6 +70,7 @@ test('runner starts ten finals concurrently, recovers an ambiguous start and res
     fs.mkdirSync(path.join(dir,'src'));
     fs.copyFileSync(path.join(__dirname,'../run.js'),path.join(dir,'run.js'));
     fs.copyFileSync(path.join(__dirname,'../src/policy.js'),path.join(dir,'src/policy.js'));
+    fs.writeFileSync(path.join(dir,'src/runtime.js'),'module.exports={startRuntimeGuard:()=>()=>{}};');
     fs.writeFileSync(path.join(dir,'src/agent.js'),`
       const fs=require('fs');
       const state={starts:0,active:0,maxActive:0,shifts:[],seeds:[],reads:[]};
@@ -80,7 +81,7 @@ test('runner starts ten finals concurrently, recovers an ambiguous start and res
         async run(){state.active++;state.maxActive=Math.max(state.maxActive,state.active);await new Promise(r=>setTimeout(r,50));state.active--;return this.summary('over');}
       }
       class RateLimiter { constructor(){this.throttled=0;} }
-      async function apiCall({cmd}){state.reads.push(cmd);return {ok:true,result:cmd==='whoami'?{team:'Ghosts',live_shifts:0}:{shifts:state.shifts}};}
+      async function apiCall({cmd}){state.reads.push(cmd);if(cmd==='whoami'&&state.invalidAuth)return {ok:false};if(cmd==='shifts'&&state.jumpToFinal)Date.now=()=>Date.parse('2026-11-08T11:00:00Z');return {ok:true,result:cmd==='whoami'?{team:'Ghosts',live_shifts:0}:{shifts:state.shifts}};}
       async function startShift({mode,seed}){
         const info={shift:'s-'+(++state.starts),mode,status:'active',seed};state.shifts.push(info);if(seed!==undefined)state.seeds.push(seed);
         if(state.starts===3){const e=new Error('response lost');e.name='AmbiguousAction';throw e;}
@@ -98,8 +99,14 @@ test('runner starts ten finals concurrently, recovers an ambiguous start and res
       if(!check.check||check.team!=='Ghosts'||state.starts!==0)throw Error('preflight started a shift');
       if(fs.readdirSync('logs').length!==0)throw Error('preflight left state or lock files');
       if(state.reads.join(',')!=='whoami,shifts')throw Error('preflight made unexpected calls');
-      Date.now=()=>Date.parse('2026-11-08T11:00:00Z');
-      await r.main(['--mode','final','--yes','--quiet']);
+      state.invalidAuth=true;
+      let rejected=false;try{await r.main(['--mode','final','--wait-until','12:00','--yes','--quiet']);}catch(e){rejected=/lag og API/.test(e.message);}
+      if(!rejected||state.starts!==0)throw Error('early final preflight did not reject invalid credentials safely');
+      if(fs.existsSync('logs/final-run.lock'))throw Error('failed preflight left final lock');
+      state.invalidAuth=false;state.jumpToFinal=true;state.reads=[];
+      await r.main(['--mode','final','--wait-until','12:00','--yes','--quiet']);
+      if(state.reads.slice(0,2).join(',')!=='whoami,shifts')throw Error('final wait skipped its early preflight');
+      state.jumpToFinal=false;
       if(state.starts!==10||state.maxActive!==10)throw Error(JSON.stringify(state));
       await r.main(['--resume','logs/final-shifts.json','--quiet']);
       if(state.starts!==10)throw Error('resume started a new shift');

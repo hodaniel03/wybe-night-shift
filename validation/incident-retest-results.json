@@ -1,0 +1,99 @@
+{
+  "checkedAt": "2026-11-08T00:40:39Z",
+  "previous": [
+    {
+      "seed": 72,
+      "score": 1719,
+      "errors": 26,
+      "maxActionGapMs": 5868818,
+      "realSeconds": 6565,
+      "slips": 0,
+      "unconfirmedReports": 0,
+      "state": "over"
+    },
+    {
+      "seed": 73,
+      "score": 1679,
+      "errors": 25,
+      "maxActionGapMs": 5864102,
+      "realSeconds": 6569,
+      "slips": 0,
+      "unconfirmedReports": 0,
+      "state": "over"
+    },
+    {
+      "seed": 74,
+      "score": 2244,
+      "errors": 26,
+      "maxActionGapMs": 5864142,
+      "realSeconds": 6583,
+      "slips": 0,
+      "unconfirmedReports": 0,
+      "state": "over"
+    },
+    {
+      "seed": 75,
+      "score": 2051,
+      "errors": 25,
+      "maxActionGapMs": 5864801,
+      "realSeconds": 6577,
+      "slips": 1,
+      "unconfirmedReports": 0,
+      "state": "over"
+    }
+  ],
+  "retest": [
+    {
+      "seed": 72,
+      "score": 1714,
+      "errors": 0,
+      "maxActionGapMs": 1846,
+      "realSeconds": 332,
+      "slips": 0,
+      "unconfirmedReports": 0,
+      "state": "over"
+    },
+    {
+      "seed": 73,
+      "score": 1722,
+      "errors": 0,
+      "maxActionGapMs": 2192,
+      "realSeconds": 334,
+      "slips": 0,
+      "unconfirmedReports": 0,
+      "state": "over"
+    },
+    {
+      "seed": 74,
+      "score": 2244,
+      "errors": 0,
+      "maxActionGapMs": 2368,
+      "realSeconds": 362,
+      "slips": 0,
+      "unconfirmedReports": 0,
+      "state": "over"
+    },
+    {
+      "seed": 75,
+      "score": 2051,
+      "errors": 0,
+      "maxActionGapMs": 2240,
+      "realSeconds": 344,
+      "slips": 1,
+      "unconfirmedReports": 0,
+      "state": "over"
+    }
+  ],
+  "leaderboard": {
+    "team": "Ghosts",
+    "rank": 18,
+    "best_practice_score": 2469,
+    "shifts_played": 279,
+    "leader": {
+      "team": "Three Guys One Repo",
+      "best_practice_score": 3448
+    }
+  },
+  "live_shifts": 0,
+  "throttleResponses": 80
+}

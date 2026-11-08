@@ -87,3 +87,13 @@ Kjør `npm test` for regresjonstestene. Se [NOTES.md](NOTES.md) for tidligere ob
 Nye kjøringer bruker den målte `efficient`-strategien: prioritering etter forventet poeng per tidsbruk, lagerreserve med ledig tralleplass, samlasting av ventende henteoppdrag og batterifeasible oppgaver sent på natten. På åtte identiske scenarioer økte snittet fra 1929 til 2110,75 (+9,4 %). Ytterligere 16 scenarioer ble fullført uten programfeil. Se valideringsrapporten for begrensningene.
 
 Vanlige startkommandoer er uendret. `--strategy baseline` velger den tidligere strategien for sammenligning. Gjenopptakelse bruker lagret strategi; eldre skift uten strategifelt fortsetter med baseline. Finalestart venter fortsatt til søndag kl. 12:00 i Oslo.
+
+
+## Dvale og driftslogg i 0.3.1
+
+`node run.js` holder nå selv en prosessbundet dvalesperre på macOS. Mac-en må fortsatt være på strøm med lokket åpent: vi observerte at lukket lokk satte maskinen i dvale selv med `caffeinate` aktiv. Lengre prosesspauser registreres etter oppvåkning i `logs/*-runtime.jsonl`. Feillogger har faktisk UTC-tid. Se `validation/INCIDENT-2026-11-08.md` for hendelsen og testresultater.
+
+
+## Sluttkontroll 0.3.2
+
+`./start-final.command` sjekker nå API-tilgang og lagring før ventingen til klokken 12. Ingen skift startes av denne kontrollen. Standardstrategien er fortsatt den målte `efficient`; nattens nye strategiforsøk ga ingen tydelig forbedring av svakeste resultater og er ikke aktivert. Se `validation/FINAL-READINESS-2026-11-08.md` for resultater og oppstart/gjenopptakelse.

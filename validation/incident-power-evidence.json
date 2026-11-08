@@ -1,0 +1,10 @@
+{
+  "timezone": "Europe/Oslo",
+  "source": "pmset -g log",
+  "events": [
+    "2026-11-07 23:27:33 +0100 Sleep               \tEntering Sleep state due to 'Clamshell Sleep':TCPKeepAlive=active Using Batt (Charge:100%) 49 secs",
+    "2026-11-07 23:34:37 +0100 Sleep               \tEntering Sleep state due to 'Maintenance Sleep':TCPKeepAlive=active Using Batt (Charge:100%) 912 secs",
+    "2026-11-08 01:11:15 +0100 DarkWake            \tDarkWake from Deep Idle [CDNP] : due to smc.70070000 lid SMC.OutboxNotEmpty/HID Activity Using BATT (Charge:100%) 1 secs",
+    "2026-11-08 01:11:16 +0100 Wake                \tDarkWake to FullWake from Deep Idle [CDNVA] : due to HID Activity Using BATT (Charge:100%)"
+  ]
+}

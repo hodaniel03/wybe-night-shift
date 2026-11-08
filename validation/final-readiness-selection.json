@@ -1,0 +1,263 @@
+{
+  "at": "2026-11-08T01:38:05.342Z",
+  "reference": {
+    "mean": 2006.125,
+    "worst": 1630,
+    "lowerQuartile": 1673,
+    "errors": 0,
+    "falseDone": 1
+  },
+  "candidates": [
+    {
+      "name": "finalist",
+      "metrics": {
+        "mean": 2008.25,
+        "worst": 1630,
+        "lowerQuartile": 1674,
+        "errors": 0,
+        "falseDone": 1
+      },
+      "comparison": {
+        "common": 8,
+        "averageDelta": 2.125,
+        "worstDelta": -7,
+        "baselineOnly": [
+          56,
+          59,
+          67,
+          57,
+          70,
+          64,
+          69,
+          62
+        ],
+        "currentOnly": [],
+        "seeds": [
+          {
+            "seed": 55,
+            "baseline": 2160,
+            "current": 2159,
+            "delta": -1
+          },
+          {
+            "seed": 58,
+            "baseline": 2457,
+            "current": 2457,
+            "delta": 0
+          },
+          {
+            "seed": 60,
+            "baseline": 1755,
+            "current": 1748,
+            "delta": -7
+          },
+          {
+            "seed": 61,
+            "baseline": 1630,
+            "current": 1630,
+            "delta": 0
+          },
+          {
+            "seed": 63,
+            "baseline": 2113,
+            "current": 2120,
+            "delta": 7
+          },
+          {
+            "seed": 65,
+            "baseline": 2469,
+            "current": 2484,
+            "delta": 15
+          },
+          {
+            "seed": 66,
+            "baseline": 1749,
+            "current": 1750,
+            "delta": 1
+          },
+          {
+            "seed": 68,
+            "baseline": 1716,
+            "current": 1718,
+            "delta": 2
+          }
+        ]
+      }
+    },
+    {
+      "name": "survey",
+      "metrics": {
+        "mean": 2004.125,
+        "worst": 1622,
+        "lowerQuartile": 1667.5,
+        "errors": 0,
+        "falseDone": 1
+      },
+      "comparison": {
+        "common": 8,
+        "averageDelta": -2,
+        "worstDelta": -8,
+        "baselineOnly": [
+          56,
+          59,
+          67,
+          57,
+          70,
+          64,
+          69,
+          62
+        ],
+        "currentOnly": [],
+        "seeds": [
+          {
+            "seed": 55,
+            "baseline": 2160,
+            "current": 2162,
+            "delta": 2
+          },
+          {
+            "seed": 58,
+            "baseline": 2457,
+            "current": 2454,
+            "delta": -3
+          },
+          {
+            "seed": 60,
+            "baseline": 1755,
+            "current": 1754,
+            "delta": -1
+          },
+          {
+            "seed": 61,
+            "baseline": 1630,
+            "current": 1622,
+            "delta": -8
+          },
+          {
+            "seed": 63,
+            "baseline": 2113,
+            "current": 2106,
+            "delta": -7
+          },
+          {
+            "seed": 65,
+            "baseline": 2469,
+            "current": 2473,
+            "delta": 4
+          },
+          {
+            "seed": 66,
+            "baseline": 1749,
+            "current": 1749,
+            "delta": 0
+          },
+          {
+            "seed": 68,
+            "baseline": 1716,
+            "current": 1713,
+            "delta": -3
+          }
+        ]
+      }
+    }
+  ],
+  "selected": "finalist",
+  "holdout": {
+    "metrics": {
+      "mean": 2166.125,
+      "worst": 1973,
+      "lowerQuartile": 1981.5,
+      "errors": 0,
+      "falseDone": 0
+    },
+    "reference": {
+      "mean": 2162.125,
+      "worst": 1971,
+      "lowerQuartile": 1979.5,
+      "errors": 0,
+      "falseDone": 0
+    },
+    "comparison": {
+      "common": 8,
+      "averageDelta": 4,
+      "worstDelta": -4,
+      "baselineOnly": [
+        65,
+        58,
+        55,
+        63,
+        60,
+        66,
+        68,
+        61
+      ],
+      "currentOnly": [],
+      "seeds": [
+        {
+          "seed": 56,
+          "baseline": 2417,
+          "current": 2417,
+          "delta": 0
+        },
+        {
+          "seed": 57,
+          "baseline": 2171,
+          "current": 2167,
+          "delta": -4
+        },
+        {
+          "seed": 59,
+          "baseline": 2287,
+          "current": 2287,
+          "delta": 0
+        },
+        {
+          "seed": 62,
+          "baseline": 1971,
+          "current": 1973,
+          "delta": 2
+        },
+        {
+          "seed": 64,
+          "baseline": 2090,
+          "current": 2113,
+          "delta": 23
+        },
+        {
+          "seed": 67,
+          "baseline": 2230,
+          "current": 2240,
+          "delta": 10
+        },
+        {
+          "seed": 69,
+          "baseline": 1988,
+          "current": 1990,
+          "delta": 2
+        },
+        {
+          "seed": 70,
+          "baseline": 2143,
+          "current": 2142,
+          "delta": -1
+        }
+      ]
+    }
+  },
+  "combined": {
+    "metrics": {
+      "mean": 2087.1875,
+      "worst": 1630,
+      "lowerQuartile": 1711.5,
+      "errors": 0,
+      "falseDone": 1
+    },
+    "reference": {
+      "mean": 2084.125,
+      "worst": 1630,
+      "lowerQuartile": 1712.5,
+      "errors": 0,
+      "falseDone": 1
+    }
+  }
+}

@@ -322,7 +322,13 @@ async function main(argv = process.argv.slice(2)) {
     args.strategy = manifest.strategy;
   }
   const releaseFinal = args.mode === 'final' ? acquireLock(path.join(logsDir,'final-run.lock')) : () => {};
+  const stopRuntime = require('./src/runtime').startRuntimeGuard({file:path.join(logsDir,`${stamp}-runtime.jsonl`)});
   try {
+    // Fail on invalid credentials or unwritable checkpoints while there is still
+    // time to fix them, rather than discovering the problem at noon. Read-only API.
+    if (args.mode === 'final' && args.waitUntil && Date.now() < FINAL_START) {
+      await preflight({key,base,logsDir});
+    }
     if (args.waitUntil) await waitUntil(args.waitUntil,args.mode);
     if (!args.resume && args.mode === 'final') assertFinalWindow();
     if (args.mode === 'final') {
@@ -373,7 +379,7 @@ async function main(argv = process.argv.slice(2)) {
     writeAtomic(path.join(logsDir,`${stamp}-${args.mode}-results.json`),{mode:args.mode,expected:manifest.expected,results,...summarize(results,manifest.expected)});
     if (limiter.throttled) console.log(`Serveren ba om lavere fart ${limiter.throttled} ganger.`);
     return results;
-  } finally { releaseFinal(); }
+  } finally { stopRuntime(); releaseFinal(); }
 }
 
 module.exports = {parseArgs,writeAtomic,readManifest,validateInfos,acquireLock,waitTarget,assertFinalWindow,summarize,mergeFinalShifts,startSafely,preflight,main,FINAL_START,FINAL_END};

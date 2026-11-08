@@ -302,6 +302,9 @@
       const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' };
       if (shift) headers['X-Shift'] = shift;
       if (limiter) await limiter.take();
+      // Queuing or laptop sleep can consume the entire deadline. Do not send
+      // an action and immediately abort it after its budget has already expired.
+      if (Date.now() >= deadline) throw new RetryableApiError(`API ${cmd} deadline expired before dispatch`);
       const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
       const timer = ctrl ? setTimeout(() => ctrl.abort(), Math.min(timeoutMs, Math.max(1, deadline - Date.now()))) : null;
       let res, body;
@@ -1953,7 +1956,7 @@
             if (e instanceof FatalApiError) throw e;
             if (e instanceof ShiftOver || this.over) return this.summary('over');
             this.errors++;
-            this.log(`ERROR during setup: ${e && e.stack || e}`);
+            this.log(`ERROR during setup [${new Date().toISOString()}]: ${e && e.stack || e}`);
             await sleep(1000);
           }
         }
@@ -1999,7 +2002,7 @@
           if (e instanceof Paused) { this.log(`PAUSED on ${e.message}`); return this.summary('paused'); }
           if (e instanceof ShiftOver || this.over) break;
           this.errors++;
-          this.log(`ERROR #${this.errors}: ${e && e.stack || e}`);
+          this.log(`ERROR #${this.errors} [${new Date().toISOString()}]: ${e && e.stack || e}`);
           const cur = this.current;
           this.current = null;
           if (cur && cur.status === 'open' && !e.retryable && !cur.pendingReport && !(this.pendingAction && !this.pendingAction.reply)) {
